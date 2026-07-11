@@ -394,10 +394,31 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 	}
 	m->parcel.mem_entries[entry].size = cpu_to_le64(run_size);
 
-	ret = p_rm_mem_share(rm, &m->parcel);
-	if (ret) {
-		pr_err("gunyah_share_66: rm_mem_share label=%u ret=%d\n", label, ret);
-		goto free_entries;
+	/* RM occasionally rejects a share (ret<0, seen as EPERM guest-side) under
+	 * churn — most likely a transient: a just-reclaimed parcel's teardown (or
+	 * the guest's stage-2 unmap of a recycled BAR offset) has not fully
+	 * settled in the RM/hyp when the new share for the reused resources
+	 * arrives.  A single such failure kills a whole guest client (a critical
+	 * BO's map fails -> zink DEVICE_LOST -> gnome-shell crash).  Retry with a
+	 * short backoff to ride out the settle window; if it never clears it is a
+	 * hard rejection and we fail as before.  (Arena mode eliminates this by
+	 * not doing per-BO shares at all.) */
+	{
+		int tries;
+		for (tries = 0; tries < 8; tries++) {
+			ret = p_rm_mem_share(rm, &m->parcel);
+			if (!ret)
+				break;
+			usleep_range(500, 1500);
+		}
+		if (ret) {
+			pr_err("gunyah_share_66: rm_mem_share label=%u ret=%d (after %d tries)\n",
+			       label, ret, tries);
+			goto free_entries;
+		}
+		if (tries)
+			pr_info("gunyah_share_66: share label=%u succeeded after %d retries\n",
+				label, tries);
 	}
 
 	*out_handle = m->parcel.mem_handle;
@@ -632,7 +653,7 @@ static int __init ghsm_init(void)
 	ret = misc_register(&ghsm_dev);
 	if (ret) return ret;
 	ghsm_dbg = debugfs_create_file("gh_share_probe", 0200, NULL, NULL, &gsp_fops);
-	pr_info("gunyah_share_66: loaded v4/liveness-gc (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
+	pr_info("gunyah_share_66: loaded v5/liveness-gc+share-retry (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
 		p_rm_mem_share, p_rm_mem_reclaim, !!p_rm_get, vmid_off, rm_off);
 	return 0;
 }
