@@ -37,6 +37,7 @@
 #include <linux/bitops.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
+#include <linux/vmalloc.h>	/* vmalloc_user/vfree: 6.12 dropped the transitive include */
 
 /* ---- UAPI (inlined; must match crosvm gunyah_sys bindings + l233 uapi) ---- */
 #define GHSM_IOCTL_TYPE 0x47 /* 'G' */
