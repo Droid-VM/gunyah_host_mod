@@ -13,11 +13,12 @@ blob to a running protected guest as an RM memparcel (the guest accepts it via
 its own HVC). No kernel patch: resolves the unexported RM helpers via kallsyms
 and reads the private structs by BTF-verified offset.
 
-- **GKI6.6/** — canonical, KMI-agnostic source (`gunyah_share_66.c`) for the
-  **upstream** `gunyah_*` gunyah driver; built for **6.6** and **6.12**
-  (v5: liveness-GC auto-reclaim + bounded share retry).
-- **GKI6.1/** — placeholder for the 6.1 port against the **downstream** `gh_rm_*`
-  gunyah (different symbol naming + struct offsets). Pending.
+- **GKI6.6/** — `gunyah_share_66.c` for the **upstream** `gunyah_*` gunyah
+  driver; built for **6.6** and **6.12** (v5: liveness-GC auto-reclaim + bounded
+  share retry).
+- **GKI6.1/** — `gunyah_share_mod.c` for the **downstream** `gh_*` gunyah driver
+  (6.1). This is the original module `gunyah_share_66` was adapted from; it
+  vendors the private `struct gh_vm` layout inline, so it needs no driver source.
 
 ## gunyah_kvcalloc — large-guest OOM fix (6.1)
 
@@ -28,5 +29,5 @@ and reads the private structs by BTF-verified offset.
   full-function hijack of the two paired functions; downstream `gh_*` /
   `struct gh_vm` (needs the private `drivers/virt/gunyah/vm_mgr.h`).
 
-So a 6.1 device shows **both** modules in the Kernel Module tab (once the 6.1
-host-share port lands); 6.6 / 6.12 show host-share only.
+So a 6.1 device shows **both** modules in the Kernel Module tab; 6.6 / 6.12 show
+host-share only.

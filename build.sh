@@ -51,12 +51,16 @@ build_mod() {
 
 case "${1:-arm64}" in
   arm64|aarch64|all)
-    # gunyah_host_share (upstream gunyah_*): one KMI-agnostic source, built per KMI.
+    # gunyah_host_share (6.6/6.12: upstream gunyah_* source; 6.1: downstream gh_* source).
+    # Both vendor the private struct layout inline, so no driver-source -I is needed.
     build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
-        gunyah_host_share/GKI6.6 gunyah_share_66.c gunyah-host-share-gki-6.6  0
+        gunyah_host_share/GKI6.6 gunyah_share_66.c  gunyah-host-share-gki-6.6  0
     build_mod android16-6.12 ghcr.io/ylarod/ddk-min:android16-6.12 \
-        gunyah_host_share/GKI6.6 gunyah_share_66.c gunyah-host-share-gki-6.12 0
-    # gunyah_kvcalloc (6.1 only, downstream gh_*): needs the private gunyah driver header.
+        gunyah_host_share/GKI6.6 gunyah_share_66.c  gunyah-host-share-gki-6.12 0
+    build_mod android15-6.1  ghcr.io/ylarod/ddk-min:android15-6.1  \
+        gunyah_host_share/GKI6.1 gunyah_share_mod.c gunyah-host-share-gki-6.1  0
+    # gunyah_kvcalloc (6.1 only, downstream gh_*): #include's vm_mgr.h, so it needs the
+    # private gunyah driver header (-I<kdir>/drivers/virt/gunyah).
     build_mod android15-6.1  ghcr.io/ylarod/ddk-min:android15-6.1  \
         gunyah_kvcalloc/GKI6.1 gunyah_kvcalloc_mod.c gunyah-kvcalloc-gki-6.1  1
     ;;
