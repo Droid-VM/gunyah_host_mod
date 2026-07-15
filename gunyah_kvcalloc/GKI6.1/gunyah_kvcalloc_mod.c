@@ -28,9 +28,11 @@
  * caller. Standard arm64 full-function-hijack pattern; needs only CONFIG_KPROBES.
  *
  * BUILD/RUN CONSTRAINTS:
- *   - Must be built against the exact kernel source whose struct gh_vm /
- *     gh_vm_mem layout matches the running kernel (same requirement as the
- *     gunyah_share_mod). struct gh_vm is a private, non-KABI struct.
+ *   - struct gh_vm / gh_vm_mem are private, non-KABI structs. Their layout is
+ *     vendored below VERBATIM from drivers/virt/gunyah/vm_mgr.h (same approach
+ *     as gunyah_share_mod), so the build needs NO gunyah driver source -- only
+ *     the matching public kernel headers/config. The vendored layout must stay
+ *     byte-identical to the running kernel's.
  *   - Only has an EFFECT on a base kernel that does NOT already carry the
  *     kvcalloc fix. If the base already uses kvcalloc/kvfree, this module is a
  *     harmless functional no-op (it just runs an identical copy).
@@ -47,12 +49,69 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/mman.h>
-#include <linux/gunyah_rsc_mgr.h>
+#include <linux/notifier.h>
+#include <linux/rbtree.h>
+#include <linux/rwsem.h>
+#include <linux/sched/mm.h>
+#include <linux/types.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 
+#include <linux/gunyah_rsc_mgr.h>
+#include <linux/gunyah_vm_mgr.h>
 #include <uapi/linux/gunyah.h>
 
-/* Private gunyah driver header; pulled in via ccflags -I drivers/virt/gunyah */
-#include "vm_mgr.h"
+/* ------------------------------------------------------------------ */
+/* Vendored gunyah private layout (drivers/virt/gunyah/vm_mgr.h, 6.1)  */
+/* struct gh_vm / gh_vm_mem are private, non-KABI structs. They are    */
+/* vendored VERBATIM (byte-identical) so this module needs no gunyah   */
+/* driver source -- the same approach gunyah_share_mod uses. Compiled  */
+/* against the same kernel headers/config, so the layout matches       */
+/* byte-for-byte. The by-value sub-structs (dtb_config / fw_config /   */
+/* exit_info) resolve from the PUBLIC <linux/gunyah_vm_mgr.h> above.   */
+/* If the gunyah driver changes, re-vendor and re-check byte layout.   */
+/* ------------------------------------------------------------------ */
+
+struct gh_vm_mem {
+	struct list_head list;
+	enum gh_vm_mem_share_type {
+		VM_MEM_SHARE,
+		VM_MEM_LEND,
+	} share_type;
+	struct gh_rm_mem_parcel parcel;
+
+	__u64 guest_phys_addr;
+	struct page **pages;
+	unsigned long npages;
+};
+
+struct gh_vm {
+	u16 vmid;
+	struct gh_rm *rm;
+	struct device *parent;
+	enum gh_rm_vm_auth_mechanism auth;
+	struct gh_vm_dtb_config dtb_config;
+	struct gh_vm_firmware_config fw_config;
+
+	struct notifier_block nb;
+	enum gh_rm_vm_status vm_status;
+	wait_queue_head_t vm_status_wait;
+	struct rw_semaphore status_lock;
+	struct gh_vm_exit_info exit_info;
+
+	struct work_struct free_work;
+	struct kref kref;
+	struct mm_struct *mm; /* userspace tied to this vm */
+	struct mutex mm_lock;
+	struct list_head memory_mappings;
+	struct mutex fn_lock;
+	struct list_head functions;
+	struct mutex resources_lock;
+	struct list_head resources;
+	struct list_head resource_tickets;
+	struct rb_root mmio_handler_root;
+	struct rw_semaphore mmio_handler_lock;
+};
 
 /* ------------------------------------------------------------------ */
 /* Runtime-resolved symbols                                            */

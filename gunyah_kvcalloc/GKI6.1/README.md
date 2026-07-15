@@ -19,7 +19,7 @@
 
 - 已导出符号直接链接:`account_locked_vm` `pin_user_pages_fast` `unpin_user_pages` `gh_rm_get_vmid`
 - `gh_rm_mem_reclaim`(全局但未导出)→ 运行时 kallsyms 解析
-- `struct gh_vm`/`gh_vm_mem` 直接 `#include "vm_mgr.h"`(`-I .../drivers/virt/gunyah`),不手抄,布局零错位
+- `struct gh_vm`/`gh_vm_mem`(私有非 KABI 结构)布局在模块内 **vendored** 逐字照抄(与 `gunyah_share_mod` 同一手法);by-value 子结构 `dtb_config`/`fw_config`/`exit_info` 由公用头 `<linux/gunyah_vm_mgr.h>` 提供,故编译**无需** gunyah 驱动源码树(不再 `#include "vm_mgr.h"`)
 
 ## 构建
 
@@ -40,7 +40,7 @@ dmesg | grep gh_kvcalloc     # "installed: ... use kvcalloc/kvfree"
 
 ## ⚠️ 重要约束
 
-1. **必须对着运行内核对应的源码编译**(struct `gh_vm` 是私有非 KABI 结构,布局要一致)。与 `gunyah_share_mod` 同样的要求。
+1. **模块内 vendored 的 `gh_vm`/`gh_vm_mem` 布局必须与运行内核字节一致**(私有非 KABI 结构)。内核改了就要重新 vendored、重新核对。与 `gunyah_share_mod` 同样的约束——但只需匹配的公用内核头,不需要驱动源码树。
 2. **只有当基线内核不带该修复时才有实际效果**。如果基线已经是 `kvcalloc/kvfree`(比如当前这份树已 cherry-pick 了 `b6ff6203`),本模块只是跑一份等价副本,是无害的功能空操作。
    - 若想让"模块"成为唯一的修复来源,应在基线内核里 revert `b6ff6203`,再靠本模块打补丁。
 3. 目标函数不能被内联/`notrace`——本例中两个都是全局符号,可被 kprobe 挂。
