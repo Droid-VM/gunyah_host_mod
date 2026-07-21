@@ -170,7 +170,7 @@ static void ghsm_map_free(struct ghsm_map *m)
 		fput(m->vm_file);
 	if (p_rm_put)
 		p_rm_put(m->rm);
-	kfree(m->pages);
+	kvfree(m->pages);
 	kfree(m->parcel.acl_entries);
 	kfree(m->parcel.mem_entries);
 	kfree(m);
@@ -332,16 +332,33 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 	}
 	mutex_unlock(&ghsm_lock);
 
-	pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL_ACCOUNT);
-	if (!pages)
+	/* kvcalloc: a 24MB blob needs a 48KB pointer array; under host fragmentation the
+	 * order-4 kmalloc intermittently ENOMEMs, killing the share. vmalloc fallback is fine
+	 * here (slow path, freed with kvfree). */
+	pages = kvcalloc(npages, sizeof(*pages), GFP_KERNEL_ACCOUNT);
+	if (!pages) {
+		pr_err("SHARE label=%u: pages[] alloc failed (npages=%lu)\n", label, npages);
 		return -ENOMEM;
+	}
 
 	gup_flags = FOLL_LONGTERM;
 	if (flags & GH_ALLOW_WRITE)
 		gup_flags |= FOLL_WRITE;
 	pinned = pin_user_pages_fast(uaddr, npages, gup_flags, pages);
-	if (pinned < 0) { ret = pinned; goto free_pages; }
-	if (pinned != npages) { ret = -EFAULT; goto unpin; }
+	if (pinned < 0) {
+		/* FOLL_LONGTERM on CMA-resident pages (our folio reserve) forces a migration
+		 * out of CMA first; under host fragmentation that migration ENOMEMs. Log it:
+		 * this failure is otherwise silent and reaches the guest as a bare map error. */
+		pr_err("SHARE label=%u: pin_user_pages_fast(npages=%lu, LONGTERM) failed: %ld\n",
+		       label, npages, pinned);
+		ret = pinned;
+		goto free_pages;
+	}
+	if (pinned != npages) {
+		pr_err("SHARE label=%u: short pin %ld/%lu\n", label, pinned, npages);
+		ret = -EFAULT;
+		goto unpin;
+	}
 
 	m = kzalloc(sizeof(*m), GFP_KERNEL);
 	if (!m) { ret = -ENOMEM; goto unpin; }
@@ -444,7 +461,7 @@ free_m:
 unpin:
 	unpin_user_pages(pages, pinned > 0 ? pinned : 0);
 free_pages:
-	kfree(pages);
+	kvfree(pages);
 	return ret;
 }
 
@@ -704,7 +721,7 @@ static void __exit ghsm_exit(void)
 			m->label, m->npages);
 		if (p_rm_put)
 			p_rm_put(m->rm);
-		kfree(m->pages); kfree(m->parcel.acl_entries);
+		kvfree(m->pages); kfree(m->parcel.acl_entries);
 		kfree(m->parcel.mem_entries); kfree(m);
 		leaked++;
 	}
