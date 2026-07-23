@@ -58,6 +58,14 @@ case "${1:-arm64}" in
     # gunyah_kvcalloc (6.1 only, downstream gh_*).
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
         gunyah_kvcalloc/GKI6.1 gunyah_kvcalloc_mod.c gunyah-kvcalloc-gki-6.1
+    # gh_unmovable (non-movable pinnable mem for small GPU blobs; KMI-agnostic,
+    # one source builds for all three via a struct-fd compat shim).
+    build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
+        gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.6
+    build_mod android16-6.12 ghcr.io/ylarod/ddk-min:android16-6.12 \
+        gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.12
+    build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
+        gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.1
     ;;
   *) echo "usage: $0 [arm64]" >&2; exit 2 ;;
 esac
