@@ -46,5 +46,27 @@ CMA was manually reclaimed first). Large blobs are unaffected — they sit in
 isolated 2 MB reserve folios. KMI-agnostic: one source (`gh_unmovable/GKI6.6/`)
 builds for 6.1 / 6.6 / 6.12 via a `struct fd` compat shim.
 
-So a 6.1 device shows **three** modules in the Kernel Module tab (host-share +
-kvcalloc + gh_unmovable); 6.6 / 6.12 show **two** (host-share + gh_unmovable).
+## udmabuf — /dev/udmabuf fallback (all KMIs)
+
+Out-of-tree copy of the upstream udmabuf driver for host kernels shipped with
+`CONFIG_UDMABUF` unset. Every GKI `gki_defconfig` since 6.1 enables it, but
+vendor kernel_platform builds (e.g. QCOM 6.1) may not — and gfxstream's
+host-visible blob path imports blob memfds as dma-bufs through `/dev/udmabuf`,
+so those hosts need this module. Init **no-ops when `/dev/udmabuf` already
+exists** (`misc_register` returns `-EEXIST` against the in-tree driver's
+device; the module stays loaded but registers nothing), so autostart is safe
+on every device. One portable source (`udmabuf/udmabuf.c`) builds for
+6.1 / 6.6 / 6.12; the per-KMI module name (`udmabuf_gki_6.1` …) keeps
+`/sys/module` from clashing with a built-in `udmabuf`.
+
+Differences from upstream: hugetlb memfds are rejected (`memfd_fcntl()` is not
+exported to modules, so seals are read via `SHMEM_I()`), the `size_limit_mb`
+page-limit arithmetic is done in u64 (upstream's int math overflows at
+>= 4096 MB), and the default cap is 4096 MB instead of 64 MB. The app daemon
+still applies its configured cap at VM start via
+`/sys/module/udmabuf*/parameters/size_limit_mb` (glob covers both the in-tree
+name and this module's).
+
+So a 6.1 device shows **four** modules in the Kernel Module tab (host-share +
+kvcalloc + gh_unmovable + udmabuf); 6.6 / 6.12 show **three** (host-share +
+gh_unmovable + udmabuf).

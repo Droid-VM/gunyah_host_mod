@@ -4,6 +4,7 @@
 #
 #   gunyah_host_share  SHARE_BLOB / GuestAccept   -> 6.6, 6.12 (upstream gunyah_*), 6.1 (gh_*)
 #   gunyah_kvcalloc    large-guest >2GB OOM fix   -> 6.1                            (downstream gh_*)
+#   udmabuf            /dev/udmabuf fallback      -> 6.1, 6.6, 6.12 (one portable source)
 #
 # Kbuild/modpost turns the '-' in the module name into '_' and keeps the '.', so the
 # loaded name matches what the app's Kernel Module tab derives from the .ko filename.
@@ -66,6 +67,17 @@ case "${1:-arm64}" in
         gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.12
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
         gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.1
+    # udmabuf fallback for vendor kernels built with CONFIG_UDMABUF unset (e.g.
+    # QCOM 6.1 kernel_platform). Init no-ops via misc_register -EEXIST when the
+    # in-tree driver already provides /dev/udmabuf, so autostart is safe on any
+    # device. One portable source for all three KMIs; the per-KMI module name
+    # keeps /sys/module from clashing with a built-in "udmabuf".
+    build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
+        udmabuf udmabuf.c udmabuf-gki-6.6
+    build_mod android16-6.12 ghcr.io/ylarod/ddk-min:android16-6.12 \
+        udmabuf udmabuf.c udmabuf-gki-6.12
+    build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
+        udmabuf udmabuf.c udmabuf-gki-6.1
     ;;
   *) echo "usage: $0 [arm64]" >&2; exit 2 ;;
 esac
