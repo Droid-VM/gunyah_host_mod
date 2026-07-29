@@ -89,15 +89,18 @@
  * The ceiling matters for guest-allocated buffers, where one BO arrives as a list of drm_buddy
  * blocks: 128 MiB of 64 KiB blocks is 2048 items, over the upstream default of 1024.
  *
- * Do not raise this much further without moving the list copy off kmalloc first. The built-in
- * ioctl memdup_user()s the item array before we ever see it, so a large limit reintroduces
- * exactly the high-order allocation failure this module exists to fix, just one function
- * earlier.
+ * The ceiling is not this number -- it is the built-in ioctl's memdup_user() of the item array,
+ * which runs before our replacement is entered and uses kmalloc. Items are 24 bytes, so 16384 of
+ * them is a 384 KiB (order-7) allocation: larger than the order-6 failure this module exists to
+ * fix. That is reachable only by a caller that actually sends that many items, which our guest
+ * cannot -- virtio_gpu's guest_pool_max_nents caps it at 1024 -- so the headroom is for other
+ * callers and costs nothing until one appears. Going higher, or making it usable, means hooking
+ * the ioctl itself so the copy is ours to make with kvmalloc.
  */
-static int list_limit = 8192;
+static int list_limit = 16384;
 module_param(list_limit, int, 0644);
 MODULE_PARM_DESC(list_limit,
-	"udmabuf_create_list->count limit. Applied to the built-in driver too in hijack mode. Default 8192.");
+	"udmabuf_create_list->count limit. Applied to the built-in driver too in hijack mode. Default 16384.");
 
 static int size_limit_mb = 4096;
 module_param(size_limit_mb, int, 0644);
