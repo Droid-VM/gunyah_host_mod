@@ -79,9 +79,25 @@
  * have to agree before anything is hooked. */
 #define UKV_FOLIO_ERA	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))
 
-static int list_limit = 1024;
+/*
+ * In native mode this is our own ceiling.  In hijack mode it is ALSO pushed into the built-in
+ * driver, because the count check for UDMABUF_CREATE_LIST lives in the built-in udmabuf_ioctl()
+ * -- before the udmabuf_create() we redirect -- so raising only this parameter has no effect on
+ * a hijacked kernel.  That asymmetry cost an afternoon: the module's limit read 8192 while lists
+ * were still being rejected at 1024 by a variable nothing pointed at.
+ *
+ * The ceiling matters for guest-allocated buffers, where one BO arrives as a list of drm_buddy
+ * blocks: 128 MiB of 64 KiB blocks is 2048 items, over the upstream default of 1024.
+ *
+ * Do not raise this much further without moving the list copy off kmalloc first. The built-in
+ * ioctl memdup_user()s the item array before we ever see it, so a large limit reintroduces
+ * exactly the high-order allocation failure this module exists to fix, just one function
+ * earlier.
+ */
+static int list_limit = 8192;
 module_param(list_limit, int, 0644);
-MODULE_PARM_DESC(list_limit, "udmabuf_create_list->count limit (native mode). Default 1024.");
+MODULE_PARM_DESC(list_limit,
+	"udmabuf_create_list->count limit. Applied to the built-in driver too in hijack mode. Default 8192.");
 
 static int size_limit_mb = 4096;
 module_param(size_limit_mb, int, 0644);
@@ -618,6 +634,50 @@ static struct kprobe ukv_kp_create = {
 
 static bool ukv_hooked;
 
+/*
+ * The built-in driver's own list_limit, and what it held before we touched it.
+ *
+ * Hijacking udmabuf_create() does not reach the UDMABUF_CREATE_LIST count check: on this
+ * kernel that check is inlined into udmabuf_ioctl(), which runs first and rejects the call
+ * before our replacement is entered.  Rather than hook a second, much larger function, raise
+ * the variable it reads.  `list_limit` resolves uniquely in kallsyms on every kernel this
+ * module targets, so the lookup is not ambiguous.
+ *
+ * Restored on unload: leaving another driver's tunable moved after rmmod would be a change
+ * nothing accounts for, and the next thing to hit the old value would have no way to explain it.
+ */
+static int *ukv_builtin_list_limit;
+static int ukv_builtin_list_limit_saved;
+
+static void ukv_raise_builtin_list_limit(void)
+{
+	int want = READ_ONCE(list_limit);
+	int *p = (int *)ukv_sym("list_limit");
+
+	if (!p) {
+		pr_info("built-in list_limit not in kallsyms; UDMABUF_CREATE_LIST stays capped at its default\n");
+		return;
+	}
+	if (*p >= want) {
+		pr_info("built-in list_limit already %d (>= %d), left alone\n", *p, want);
+		return;
+	}
+
+	ukv_builtin_list_limit = p;
+	ukv_builtin_list_limit_saved = *p;
+	WRITE_ONCE(*p, want);
+	pr_info("built-in list_limit %d -> %d\n", ukv_builtin_list_limit_saved, want);
+}
+
+static void ukv_restore_builtin_list_limit(void)
+{
+	if (!ukv_builtin_list_limit)
+		return;
+	WRITE_ONCE(*ukv_builtin_list_limit, ukv_builtin_list_limit_saved);
+	pr_info("built-in list_limit restored to %d\n", ukv_builtin_list_limit_saved);
+	ukv_builtin_list_limit = NULL;
+}
+
 /**
  * ukv_bl_target - absolute target of an arm64 "BL imm26", or 0 if not a BL.
  *
@@ -806,8 +866,9 @@ static int __init ukv_init(void)
 			break;
 		}
 		ukv_hooked = true;
-		pr_info("mode=hijack: udmabuf_create redirected, size_limit_mb=%d\n",
-			READ_ONCE(size_limit_mb));
+		ukv_raise_builtin_list_limit();
+		pr_info("mode=hijack: udmabuf_create redirected, size_limit_mb=%d list_limit=%d\n",
+			READ_ONCE(size_limit_mb), READ_ONCE(list_limit));
 		break;
 	case UKV_NOOP:
 		pr_info("mode=noop: this kernel needs nothing from us\n");
@@ -820,8 +881,10 @@ static int __init ukv_init(void)
 
 static void __exit ukv_exit(void)
 {
-	if (ukv_hooked)
+	if (ukv_hooked) {
 		unregister_kprobe(&ukv_kp_create);
+		ukv_restore_builtin_list_limit();
+	}
 	if (ukv_misc_registered)
 		misc_deregister(&ukv_misc);
 	pr_info("removed (mode=%s, created=%d)\n", mode, stat_created);
