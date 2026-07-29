@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Userspace ABI for the standalone gunyah_share module.
  *

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * gh_unmovable -- non-movable, FOLL_LONGTERM-pinnable userspace memory for
  * DroidVM's SMALL host-visible GPU blobs.

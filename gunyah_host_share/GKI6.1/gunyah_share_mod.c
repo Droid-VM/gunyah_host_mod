@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * gunyah_share_mod - standalone (out-of-tree) decoupling of the in-tree
  * gunyah SHARE_BLOB patch + the "命门探针" host-side lend/share probe.

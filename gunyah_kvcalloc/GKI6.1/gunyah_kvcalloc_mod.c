@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * gunyah_kvcalloc_mod - out-of-tree fix for large-guest OOM in the Gunyah
  * vm_mgr memory path.

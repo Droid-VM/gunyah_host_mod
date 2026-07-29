@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * gunyah_share_66 — standalone out-of-tree runtime-SHARE module for the
  * *upstream* GKI 6.6 gunyah driver (android15-6.6). Reproduces an in-tree
