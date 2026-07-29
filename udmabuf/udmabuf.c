@@ -89,13 +89,16 @@
  * The ceiling matters for guest-allocated buffers, where one BO arrives as a list of drm_buddy
  * blocks: 128 MiB of 64 KiB blocks is 2048 items, over the upstream default of 1024.
  *
- * The ceiling is not this number -- it is the built-in ioctl's memdup_user() of the item array,
- * which runs before our replacement is entered and uses kmalloc. Items are 24 bytes, so 16384 of
- * them is a 384 KiB (order-7) allocation: larger than the order-6 failure this module exists to
- * fix. That is reachable only by a caller that actually sends that many items, which our guest
- * cannot -- virtio_gpu's guest_pool_max_nents caps it at 1024 -- so the headroom is for other
- * callers and costs nothing until one appears. Going higher, or making it usable, means hooking
- * the ioctl itself so the copy is ours to make with kvmalloc.
+ * A long list has its own high-order allocation, separate from the page array: the item array
+ * copied in from userspace, 24 bytes an entry, which upstream copies with memdup_user() --
+ * documented as physically contiguous, freed with kfree. 16384 items is 384 KiB, order-7, i.e.
+ * worse than the order-6 page-array failure this module was written for. Fixing only the page
+ * array would have moved the fragmentation cliff one function earlier rather than removing it.
+ *
+ * So both allocations are ours now: ukv_ioctl_create_list() uses vmemdup_user(), and hijack mode
+ * redirects udmabuf_ioctl as well as udmabuf_create so that copy runs in our code. Where the
+ * ioctl cannot be hooked we fall back to raising the built-in's own list_limit, and then this
+ * ceiling is only as usable as the built-in's contiguous copy allows.
  */
 static int list_limit = 16384;
 module_param(list_limit, int, 0644);
@@ -540,12 +543,19 @@ static long ukv_ioctl_create_list(struct file *filp, unsigned long arg)
 	if (head.count > list_limit)
 		return -EINVAL;
 	lsize = sizeof(struct udmabuf_create_item) * head.count;
-	list = memdup_user((void __user *)(arg + sizeof(head)), lsize);
+	/*
+	 * vmemdup_user, not memdup_user: the latter documents its result as physically contiguous
+	 * and frees with kfree, i.e. it is a kmalloc. At 24 bytes an item, a long list is a large
+	 * high-order allocation -- 16384 items is 384 KiB, order-7 -- which is the same failure
+	 * mode this module exists to remove from the page array, just a different array. Fixing one
+	 * and leaving the other only moves the fragmentation cliff one function earlier.
+	 */
+	list = vmemdup_user((void __user *)(arg + sizeof(head)), lsize);
 	if (IS_ERR(list))
 		return PTR_ERR(list);
 
 	ret = ukv_create(filp->private_data, &head, list);
-	kfree(list);
+	kvfree(list);
 	return ret;
 }
 
@@ -635,7 +645,43 @@ static struct kprobe ukv_kp_create = {
 	.pre_handler = ukv_pre_create,
 };
 
+/*
+ * Hooking udmabuf_create() alone leaves the built-in ioctl in charge of copying the
+ * UDMABUF_CREATE_LIST item array, and it does that with memdup_user() -- a physically contiguous
+ * kmalloc. For a long list that is the very high-order allocation this module exists to avoid,
+ * one function before the one we replaced, and no amount of raising list_limit helps because the
+ * copy fails first. Redirecting the ioctl too puts both allocations under our own code, so the
+ * limit means what it says.
+ *
+ * Same mechanism as above: the kprobe fires at the first instruction, x0..x2 still hold
+ * (filp, ioctl, arg), so the replacement runs as if it had been called.
+ */
+static long ukv_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg);
+
+static long ukv_ioctl_hijacked(struct file *filp, unsigned int ioctl, unsigned long arg)
+{
+	long ret = ukv_ioctl(filp, ioctl, arg);
+
+	module_put(THIS_MODULE);
+	return ret;
+}
+
+static int ukv_pre_ioctl(struct kprobe *p, struct pt_regs *regs)
+{
+	if (!try_module_get(THIS_MODULE))
+		return 0;
+
+	instruction_pointer_set(regs, (unsigned long)ukv_ioctl_hijacked);
+	return 1;
+}
+
+static struct kprobe ukv_kp_ioctl = {
+	.symbol_name = "udmabuf_ioctl",
+	.pre_handler = ukv_pre_ioctl,
+};
+
 static bool ukv_hooked;
+static bool ukv_ioctl_hooked;
 
 /*
  * The built-in driver's own list_limit, and what it held before we touched it.
@@ -869,8 +915,15 @@ static int __init ukv_init(void)
 			break;
 		}
 		ukv_hooked = true;
-		ukv_raise_builtin_list_limit();
-		pr_info("mode=hijack: udmabuf_create redirected, size_limit_mb=%d list_limit=%d\n",
+		/* Optional: without it CREATE_LIST still works, it just keeps the built-in's
+		 * contiguous item copy and its own list_limit. Report which one we got. */
+		if (register_kprobe(&ukv_kp_ioctl) == 0)
+			ukv_ioctl_hooked = true;
+		else
+			ukv_raise_builtin_list_limit();
+		pr_info("mode=hijack: %s redirected, size_limit_mb=%d list_limit=%d\n",
+			ukv_ioctl_hooked ? "udmabuf_ioctl + udmabuf_create"
+					 : "udmabuf_create",
 			READ_ONCE(size_limit_mb), READ_ONCE(list_limit));
 		break;
 	case UKV_NOOP:
@@ -884,6 +937,8 @@ static int __init ukv_init(void)
 
 static void __exit ukv_exit(void)
 {
+	if (ukv_ioctl_hooked)
+		unregister_kprobe(&ukv_kp_ioctl);
 	if (ukv_hooked) {
 		unregister_kprobe(&ukv_kp_create);
 		ukv_restore_builtin_list_limit();
