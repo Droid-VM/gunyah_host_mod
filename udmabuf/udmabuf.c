@@ -4,19 +4,24 @@
  * for gfxstream, whatever state its built-in driver is in.  It picks ONE of
  * three modes at insmod and logs which:
  *
- *   native  - no built-in provider (CONFIG_UDMABUF unset): register /dev/udmabuf
- *             ourselves.  The driver below is the upstream one, version-gated
- *             for 6.1 / 6.6+, with the page-pointer array allocated by
- *             kvmalloc from the start.
- *   hijack  - built-in provider present but UNFIXED (allocates the page-pointer
- *             array with kmalloc_array, so a 128 MiB dma-buf needs a contiguous
- *             order-6 allocation and fails once memory is fragmented - the bug
- *             fixed upstream for the folio driver as CVE-2024-56544).  A kprobe
- *             redirects the built-in udmabuf_create() to ours.
- *   noop    - built-in provider present and already fixed (or too new / not
- *             safely hookable): the module loads and does nothing.
+ *   native    - no built-in provider (CONFIG_UDMABUF unset): register
+ *               /dev/udmabuf ourselves.  The driver below is the upstream one,
+ *               version-gated for 6.1 / 6.6+, with the page-pointer array
+ *               allocated by kvmalloc from the start.
+ *   override  - built-in provider present but UNFIXED (allocates the
+ *               page-pointer array with kmalloc_array, so a 128 MiB dma-buf
+ *               needs a contiguous order-6 allocation and fails once memory is
+ *               fragmented - the bug fixed upstream for the folio driver as
+ *               CVE-2024-56544).  A kprobe redirects the built-in
+ *               udmabuf_create() to ours.
+ *   paramonly - built-in provider present and already fixed (or too new / not
+ *               safely hookable): leave its code alone and only raise its two
+ *               tunables, size_limit_mb and list_limit.  Upstream's 64 MiB
+ *               default is far below what a VkDeviceMemory blob needs now that
+ *               they travel as dma-bufs, so "already fixed" is not the same as
+ *               "needs nothing from us".
  *
- * The hijack replacement returns a dma_buf that is entirely OURS - our
+ * The override replacement returns a dma_buf that is entirely OURS - our
  * dma_buf_ops, our private struct - so the built-in driver's own ops never see
  * our objects and we never see its private struct.  That is what makes hooking
  * one function enough: no vendored `struct udmabuf` layout to get wrong, and no
@@ -35,8 +40,10 @@
  *     that support here).  Only tmpfs/shmem memfds are accepted.
  *   - size_limit_mb defaults to 4096, and its page limit is computed in u64:
  *     upstream's int math overflows at >= 4096 (16384 -> 2^34 truncates to 0,
- *     rejecting everything).  In hijack mode this parameter, not the built-in's
- *     size_limit_mb, is the one that counts.
+ *     rejecting everything).  In override mode this parameter, not the
+ *     built-in's size_limit_mb, is the one that counts; in paramonly mode the
+ *     built-in's own variable is what we raise, and it is clamped to what its
+ *     int math can survive.
  */
 
 #define pr_fmt(fmt) "udmabuf_kv: " fmt
@@ -80,11 +87,12 @@
 #define UKV_FOLIO_ERA	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0))
 
 /*
- * In native mode this is our own ceiling.  In hijack mode it is ALSO pushed into the built-in
- * driver, because the count check for UDMABUF_CREATE_LIST lives in the built-in udmabuf_ioctl()
- * -- before the udmabuf_create() we redirect -- so raising only this parameter has no effect on
- * a hijacked kernel.  That asymmetry cost an afternoon: the module's limit read 8192 while lists
- * were still being rejected at 1024 by a variable nothing pointed at.
+ * In native mode this is our own ceiling.  In override and paramonly modes it is ALSO pushed into
+ * the built-in driver, because the count check for UDMABUF_CREATE_LIST lives in the built-in
+ * udmabuf_ioctl() -- before the udmabuf_create() we redirect -- so raising only this parameter
+ * has no effect on a kernel whose ioctl we did not replace.  That asymmetry cost an afternoon:
+ * the module's limit read 8192 while lists were still being rejected at 1024 by a variable
+ * nothing pointed at.
  *
  * The ceiling matters for guest-allocated buffers, where one BO arrives as a list of drm_buddy
  * blocks: 128 MiB of 64 KiB blocks is 2048 items, over the upstream default of 1024.
@@ -95,29 +103,55 @@
  * worse than the order-6 page-array failure this module was written for. Fixing only the page
  * array would have moved the fragmentation cliff one function earlier rather than removing it.
  *
- * So both allocations are ours now: ukv_ioctl_create_list() uses vmemdup_user(), and hijack mode
+ * So both allocations are ours now: ukv_ioctl_create_list() uses vmemdup_user(), and override mode
  * redirects udmabuf_ioctl as well as udmabuf_create so that copy runs in our code. Where the
- * ioctl cannot be hooked we fall back to raising the built-in's own list_limit, and then this
- * ceiling is only as usable as the built-in's contiguous copy allows.
+ * ioctl is not ours -- paramonly always, override when the second kprobe fails -- we raise the
+ * built-in's own list_limit instead, and then this ceiling is only as usable as the built-in's
+ * contiguous copy allows.
  */
+
+/*
+ * Both limits are writable at runtime, and a write has to reach wherever the check actually
+ * lives.  The app daemon applies its configured cap at VM start by writing size_limit_mb, and in
+ * the modes where the built-in driver is still the one serving, a value that only landed in our
+ * own variable would be silently ignored -- configured 512 MiB, enforced 64.  So the setter
+ * re-pushes into the built-in driver for whichever tunables this mode manages.
+ */
+static void ukv_push_builtin_limits(void);
+
+static int ukv_param_set_limit(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		ukv_push_builtin_limits();
+	return ret;
+}
+
+static const struct kernel_param_ops ukv_limit_ops = {
+	.set = ukv_param_set_limit,
+	.get = param_get_int,
+};
+
 static int list_limit = 16384;
-module_param(list_limit, int, 0644);
+module_param_cb(list_limit, &ukv_limit_ops, &list_limit, 0644);
 MODULE_PARM_DESC(list_limit,
-	"udmabuf_create_list->count limit. Applied to the built-in driver too in hijack mode. Default 16384.");
+	"udmabuf_create_list->count limit. Pushed into the built-in driver too. Default 16384.");
 
 static int size_limit_mb = 4096;
-module_param(size_limit_mb, int, 0644);
-MODULE_PARM_DESC(size_limit_mb, "Max size of a dmabuf, in megabytes. Default 4096.");
+module_param_cb(size_limit_mb, &ukv_limit_ops, &size_limit_mb, 0644);
+MODULE_PARM_DESC(size_limit_mb,
+	"Max size of a dmabuf, in megabytes. Default 4096 (clamped to 2047 when pushed into the built-in driver).");
 
 static char *force_mode = "auto";
 module_param(force_mode, charp, 0444);
 MODULE_PARM_DESC(force_mode,
-	"Override mode selection: auto (default), native, hijack or noop.");
+	"Override mode selection: auto (default), native, override or paramonly.");
 
 /* Settled mode, readable at /sys/module/<name>/parameters/mode. */
-static char mode[8] = "unset";
+static char mode[16] = "unset";
 module_param_string(mode, mode, sizeof(mode), 0444);
-MODULE_PARM_DESC(mode, "Mode this module settled on: native, hijack or noop (read-only).");
+MODULE_PARM_DESC(mode, "Mode this module settled on: native, override or paramonly (read-only).");
 
 static int stat_created;
 module_param(stat_created, int, 0444);
@@ -166,7 +200,7 @@ static void ukv_resolve_optional(void)
 }
 
 /* ------------------------------------------------------------------------- */
-/* The driver (shared by native and hijack mode)                             */
+/* The driver (shared by native and override mode)                             */
 /* ------------------------------------------------------------------------- */
 
 struct udmabuf_kv {
@@ -383,11 +417,11 @@ static long ukv_seals(struct file *memfd)
 /**
  * ukv_create - build a dma-buf from a list of memfd ranges.
  * @device: miscdevice whose this_device is the DMA device for the sg table.
- *          Ours in native mode, the built-in driver's in hijack mode - both
+ *          Ours in native mode, the built-in driver's in override mode - both
  *          only ever used as a DMA device, never for its private data.
  *
  * Returns a new fd, or a negative errno.  Same contract as the in-tree
- * udmabuf_create(), which is what lets the hijack jump straight here.
+ * udmabuf_create(), which is what lets the override jump straight here.
  */
 static long ukv_create(struct miscdevice *device,
 		       struct udmabuf_create_list *head,
@@ -616,7 +650,7 @@ static int ukv_native_start(void)
  * arguments (the kprobe fires at its first instruction, before the prologue
  * touches them), so the replacement just runs as if it had been called.
  */
-static long ukv_create_hijacked(struct miscdevice *device,
+static long ukv_create_redirected(struct miscdevice *device,
 				struct udmabuf_create_list *head,
 				struct udmabuf_create_item *list)
 {
@@ -636,7 +670,7 @@ static int ukv_pre_create(struct kprobe *p, struct pt_regs *regs)
 	if (!try_module_get(THIS_MODULE))
 		return 0;
 
-	instruction_pointer_set(regs, (unsigned long)ukv_create_hijacked);
+	instruction_pointer_set(regs, (unsigned long)ukv_create_redirected);
 	return 1;	/* do not execute the probed instruction */
 }
 
@@ -658,7 +692,7 @@ static struct kprobe ukv_kp_create = {
  */
 static long ukv_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg);
 
-static long ukv_ioctl_hijacked(struct file *filp, unsigned int ioctl, unsigned long arg)
+static long ukv_ioctl_redirected(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
 	long ret = ukv_ioctl(filp, ioctl, arg);
 
@@ -671,7 +705,7 @@ static int ukv_pre_ioctl(struct kprobe *p, struct pt_regs *regs)
 	if (!try_module_get(THIS_MODULE))
 		return 0;
 
-	instruction_pointer_set(regs, (unsigned long)ukv_ioctl_hijacked);
+	instruction_pointer_set(regs, (unsigned long)ukv_ioctl_redirected);
 	return 1;
 }
 
@@ -684,47 +718,100 @@ static bool ukv_hooked;
 static bool ukv_ioctl_hooked;
 
 /*
- * The built-in driver's own list_limit, and what it held before we touched it.
+ * The built-in driver's own tunables, and what they held before we touched them.
  *
- * Hijacking udmabuf_create() does not reach the UDMABUF_CREATE_LIST count check: on this
- * kernel that check is inlined into udmabuf_ioctl(), which runs first and rejects the call
- * before our replacement is entered.  Rather than hook a second, much larger function, raise
- * the variable it reads.  `list_limit` resolves uniquely in kallsyms on every kernel this
- * module targets, so the lookup is not ambiguous.
+ * Two checks live in built-in code we do not replace:
  *
- * Restored on unload: leaving another driver's tunable moved after rmmod would be a change
- * nothing accounts for, and the next thing to hit the old value would have no way to explain it.
+ *   list_limit    - the UDMABUF_CREATE_LIST count check is inlined into udmabuf_ioctl(), which
+ *                   runs before the udmabuf_create() override mode redirects.  Rather than hook
+ *                   a second, much larger function, raise the variable it reads.
+ *   size_limit_mb - the per-buffer page limit, checked inside udmabuf_create().  Override mode
+ *                   replaces that function outright, so this one only matters in paramonly mode,
+ *                   where upstream's 64 MiB default is the whole reason the mode exists.
+ *
+ * Both names resolve uniquely in kallsyms on every kernel this module targets, so the lookups
+ * are not ambiguous.  Restored on unload: leaving another driver's tunable moved after rmmod
+ * would be a change nothing accounts for, and the next thing to hit the old value would have no
+ * way to explain it.
  */
-static int *ukv_builtin_list_limit;
-static int ukv_builtin_list_limit_saved;
+struct ukv_builtin_tunable {
+	const char *name;
+	int *addr;	/* the built-in's variable, NULL when it could not be resolved */
+	int saved;	/* what it held before we first touched it */
+	bool probed;	/* kallsyms lookup already done, hit or miss */
+	bool managed;	/* this mode pushes our value into it */
+};
 
-static void ukv_raise_builtin_list_limit(void)
+static struct ukv_builtin_tunable ukv_builtin_list_limit = { .name = "list_limit" };
+static struct ukv_builtin_tunable ukv_builtin_size_limit = { .name = "size_limit_mb" };
+
+/*
+ * Highest size_limit_mb the built-in driver's own arithmetic survives.
+ *
+ * Upstream computes `pglimit = (size_limit_mb * 1024 * 1024) >> PAGE_SHIFT` with size_limit_mb
+ * an int, so the multiply is done in 32 bits: 2048 already reaches 2^31 and 4096 truncates to
+ * zero, which rejects every buffer.  Writing this module's own 4096 straight into the built-in
+ * would therefore turn "64 MiB cap" into "nothing works at all" -- a far worse failure, and one
+ * that would look like the module broke udmabuf rather than fixed it.  2047 MiB is the largest
+ * value whose product still fits, and it is ~32x the default we came to raise.
+ */
+#define UKV_BUILTIN_SIZE_LIMIT_MB_MAX	2047
+
+static void ukv_push_builtin(struct ukv_builtin_tunable *t, int want)
 {
-	int want = READ_ONCE(list_limit);
-	int *p = (int *)ukv_sym("list_limit");
+	int now;
 
-	if (!p) {
-		pr_info("built-in list_limit not in kallsyms; UDMABUF_CREATE_LIST stays capped at its default\n");
-		return;
+	if (!t->probed) {
+		t->probed = true;
+		t->addr = (int *)ukv_sym(t->name);
+		if (!t->addr) {
+			pr_info("built-in %s not in kallsyms; it stays at its default\n", t->name);
+			return;
+		}
+		t->saved = READ_ONCE(*t->addr);
 	}
-	if (*p >= want) {
-		pr_info("built-in list_limit already %d (>= %d), left alone\n", *p, want);
+	if (!t->addr)
 		return;
-	}
 
-	ukv_builtin_list_limit = p;
-	ukv_builtin_list_limit_saved = *p;
-	WRITE_ONCE(*p, want);
-	pr_info("built-in list_limit %d -> %d\n", ukv_builtin_list_limit_saved, want);
+	/* Never below what the kernel shipped with.  A later, smaller write from the daemon
+	 * should still be followed -- the parameter has to mean what it says -- but not past
+	 * the point where this module would be removing capability rather than adding it. */
+	want = max(want, t->saved);
+	now = READ_ONCE(*t->addr);
+	if (now == want)
+		return;
+	WRITE_ONCE(*t->addr, want);
+	pr_info("built-in %s %d -> %d\n", t->name, now, want);
 }
 
-static void ukv_restore_builtin_list_limit(void)
+static void ukv_restore_builtin(struct ukv_builtin_tunable *t)
 {
-	if (!ukv_builtin_list_limit)
+	if (!t->addr || READ_ONCE(*t->addr) == t->saved)
 		return;
-	WRITE_ONCE(*ukv_builtin_list_limit, ukv_builtin_list_limit_saved);
-	pr_info("built-in list_limit restored to %d\n", ukv_builtin_list_limit_saved);
-	ukv_builtin_list_limit = NULL;
+	WRITE_ONCE(*t->addr, t->saved);
+	pr_info("built-in %s restored to %d\n", t->name, t->saved);
+}
+
+/*
+ * Apply this mode's policy to the built-in driver.  Called once at insmod and again on every
+ * runtime write to either parameter.  `managed` is what makes it a no-op in the modes where the
+ * built-in's copy of a limit is dead code -- override mode replaces the udmabuf_create() that
+ * reads size_limit_mb, and when its second kprobe lands it replaces the ioctl reading list_limit
+ * too, so writing those variables would move a number nothing consults.
+ */
+static void ukv_push_builtin_limits(void)
+{
+	if (ukv_builtin_size_limit.managed)
+		ukv_push_builtin(&ukv_builtin_size_limit,
+				 min(READ_ONCE(size_limit_mb), UKV_BUILTIN_SIZE_LIMIT_MB_MAX));
+	if (ukv_builtin_list_limit.managed)
+		ukv_push_builtin(&ukv_builtin_list_limit, READ_ONCE(list_limit));
+}
+
+static void ukv_restore_builtin_all(void)
+{
+	ukv_restore_builtin(&ukv_builtin_list_limit);
+	ukv_restore_builtin(&ukv_builtin_size_limit);
 }
 
 /**
@@ -820,19 +907,21 @@ static bool ukv_builtin_is_fixed(unsigned long create)
 /* Mode selection                                                            */
 /* ------------------------------------------------------------------------- */
 
-enum ukv_mode { UKV_NOOP, UKV_NATIVE, UKV_HIJACK };
+enum ukv_mode { UKV_PARAMONLY, UKV_NATIVE, UKV_OVERRIDE };
 
 static void ukv_set_mode(enum ukv_mode m)
 {
 	strscpy(mode, m == UKV_NATIVE ? "native" :
-		      m == UKV_HIJACK ? "hijack" : "noop", sizeof(mode));
+		      m == UKV_OVERRIDE ? "override" : "paramonly", sizeof(mode));
 }
 
 /**
  * ukv_pick_mode - decide what this kernel needs.
  *
- * Anything unexpected lands on noop: this module exists to add a capability or
- * repair one, never to take a working /dev/udmabuf away from the system.
+ * Anything unexpected lands on paramonly: this module exists to add a
+ * capability or repair one, never to take a working /dev/udmabuf away from the
+ * system.  Note that paramonly is not "do nothing" -- it still raises the
+ * built-in's limits, which every kernel needs, fixed or not.
  */
 static enum ukv_mode ukv_pick_mode(void)
 {
@@ -850,21 +939,21 @@ static enum ukv_mode ukv_pick_mode(void)
 
 	if (UKV_FOLIO_ERA || ukv_sym("memfd_pin_folios")) {
 		pr_info("built-in udmabuf is the folio-based driver (>= 6.10), which carries the fix\n");
-		return UKV_NOOP;
+		return UKV_PARAMONLY;
 	}
 
 	if (!create) {
 		pr_info("built-in udmabuf present but udmabuf_create is not in kallsyms; cannot hook\n");
-		return UKV_NOOP;
+		return UKV_PARAMONLY;
 	}
 
 	if (ukv_builtin_is_fixed(create)) {
-		pr_info("built-in udmabuf already allocates with kvmalloc; nothing to do\n");
-		return UKV_NOOP;
+		pr_info("built-in udmabuf already allocates with kvmalloc; its code needs nothing\n");
+		return UKV_PARAMONLY;
 	}
 
 	pr_info("built-in udmabuf allocates its page array with kmalloc (unfixed)\n");
-	return UKV_HIJACK;
+	return UKV_OVERRIDE;
 }
 
 static int __init ukv_init(void)
@@ -878,10 +967,10 @@ static int __init ukv_init(void)
 
 	if (!strcmp(force_mode, "native"))
 		m = UKV_NATIVE;
-	else if (!strcmp(force_mode, "hijack"))
-		m = UKV_HIJACK;
-	else if (!strcmp(force_mode, "noop"))
-		m = UKV_NOOP;
+	else if (!strcmp(force_mode, "override"))
+		m = UKV_OVERRIDE;
+	else if (!strcmp(force_mode, "paramonly"))
+		m = UKV_PARAMONLY;
 	else {
 		if (strcmp(force_mode, "auto"))
 			pr_warn("unknown force_mode \"%s\", using auto\n", force_mode);
@@ -894,8 +983,8 @@ static int __init ukv_init(void)
 		ret = ukv_native_start();
 		if (ret == -EEXIST) {
 			/* Someone owns /dev/udmabuf after all. */
-			pr_info("/dev/udmabuf already exists; standing down\n");
-			m = UKV_NOOP;
+			pr_info("/dev/udmabuf already exists; standing down to paramonly\n");
+			m = UKV_PARAMONLY;
 			break;
 		}
 		if (ret < 0) {
@@ -905,13 +994,14 @@ static int __init ukv_init(void)
 		pr_info("mode=native: /dev/udmabuf registered, size_limit_mb=%d\n",
 			READ_ONCE(size_limit_mb));
 		break;
-	case UKV_HIJACK:
+	case UKV_OVERRIDE:
 		ret = register_kprobe(&ukv_kp_create);
 		if (ret < 0) {
 			pr_err("could not hook udmabuf_create: %d\n", ret);
 			if (forced)
 				return ret;
-			m = UKV_NOOP;
+			/* Its code stays broken, but its limits are still ours to raise. */
+			m = UKV_PARAMONLY;
 			break;
 		}
 		ukv_hooked = true;
@@ -920,15 +1010,30 @@ static int __init ukv_init(void)
 		if (register_kprobe(&ukv_kp_ioctl) == 0)
 			ukv_ioctl_hooked = true;
 		else
-			ukv_raise_builtin_list_limit();
-		pr_info("mode=hijack: %s redirected, size_limit_mb=%d list_limit=%d\n",
+			ukv_builtin_list_limit.managed = true;
+		/* size_limit_mb stays unmanaged: it is checked inside the udmabuf_create()
+		 * we just replaced, so the built-in's copy of it is dead code here. */
+		ukv_push_builtin_limits();
+		pr_info("mode=override: %s redirected, size_limit_mb=%d list_limit=%d\n",
 			ukv_ioctl_hooked ? "udmabuf_ioctl + udmabuf_create"
 					 : "udmabuf_create",
 			READ_ONCE(size_limit_mb), READ_ONCE(list_limit));
 		break;
-	case UKV_NOOP:
-		pr_info("mode=noop: this kernel needs nothing from us\n");
+	case UKV_PARAMONLY:
 		break;
+	}
+
+	/*
+	 * Reached either by choice or by demotion from the two cases above, so it sits after the
+	 * switch rather than inside it.  The built-in driver keeps serving and we only lift its
+	 * ceilings: a dma-buf per VkDeviceMemory blob does not fit under upstream's 64 MiB
+	 * default, whether or not that driver also has the kmalloc bug.
+	 */
+	if (m == UKV_PARAMONLY) {
+		ukv_builtin_size_limit.managed = true;
+		ukv_builtin_list_limit.managed = true;
+		ukv_push_builtin_limits();
+		pr_info("mode=paramonly: built-in driver left in charge, its limits raised\n");
 	}
 
 	ukv_set_mode(m);
@@ -939,10 +1044,10 @@ static void __exit ukv_exit(void)
 {
 	if (ukv_ioctl_hooked)
 		unregister_kprobe(&ukv_kp_ioctl);
-	if (ukv_hooked) {
+	if (ukv_hooked)
 		unregister_kprobe(&ukv_kp_create);
-		ukv_restore_builtin_list_limit();
-	}
+	/* Unconditional: paramonly raises the built-in's tunables without hooking anything. */
+	ukv_restore_builtin_all();
 	if (ukv_misc_registered)
 		misc_deregister(&ukv_misc);
 	pr_info("removed (mode=%s, created=%d)\n", mode, stat_created);

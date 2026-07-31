@@ -70,7 +70,8 @@ case "${1:-arm64}" in
     # udmabuf: registers /dev/udmabuf where the kernel has none (CONFIG_UDMABUF
     # unset, e.g. QCOM 6.1 kernel_platform), kprobe-repairs the built-in where it
     # still kmalloc_arrays its page-pointer array (all GKI 6.6 - order-6 alloc
-    # fails on a fragmented phone), and no-ops where the kernel is already fixed.
+    # fails on a fragmented phone), and where the kernel is already fixed still
+    # raises its 64 MiB size cap, which no VkDeviceMemory blob fits under.
     # Safe to autostart on any device. One portable source for all three KMIs;
     # the per-KMI module name keeps /sys/module from clashing with a built-in
     # "udmabuf".
