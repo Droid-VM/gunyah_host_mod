@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * gunyah_share_66 — standalone out-of-tree runtime-SHARE module for the
- * *upstream* GKI 6.6 gunyah driver (android15-6.6). Reproduces an in-tree
+ * gunyah_share_mod — standalone out-of-tree runtime-SHARE module for the
+ * *upstream* gunyah driver. This copy (GKI6.6/) serves android15-6.6 AND
+ * android16-6.12: their struct gunyah_vm is identical up to every field we
+ * touch, so one source builds both. GKI6.1/ holds the sibling copy for the
+ * downstream gh_* driver. The directory says which driver a copy is for --
+ * the file name is the same in both on purpose. Reproduces an in-tree
  * "SHARE_BLOB" ioctl without patching drivers/virt/gunyah.
  *
  * Purpose: let crosvm SHARE an arbitrary userspace buffer (a host-visible
@@ -15,12 +19,16 @@
  * (gunyah_vm_ioctl) is static; we expose our own /dev/gunyah_share char device
  * and take the VM fd as a request field. The RM RPC helpers
  * (gunyah_rm_mem_share/reclaim) are global but NOT EXPORT_SYMBOL, so we resolve
- * them via kallsyms. struct gunyah_vm is private; we read vmid/rm by BTF-verified
- * byte offset (overridable via module params if a future build shifts them).
+ * them via kallsyms. struct gunyah_vm is private; we read vmid/rm/vm_status by
+ * BTF-verified byte offset (overridable via module params if a build shifts them).
  *
- * FRAGILE BY DESIGN: pinned to this device's KMI (6.6.118-android15). Verify
- * the struct offsets against the target vmlinux.btf before trusting on another build.
+ * FRAGILE BY DESIGN: the offsets below were read out of a live 6.6.118-android15
+ * vmlinux.btf and re-derived from the 6.12 source; every field we touch sits ahead
+ * of everything 6.12 added, which is why one source serves both. Verify them
+ * against the target vmlinux.btf before trusting this on another build.
  */
+#define pr_fmt(fmt) "gunyah_share: " fmt
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -91,11 +99,42 @@ struct gunyah_rm_mem_parcel {
 #define GH_ALLOW_WRITE	(1u << 1)
 #define GH_ALLOW_EXEC	(1u << 2)
 
-/* struct gunyah_vm private-layout offsets (BTF vmlinux.btf, 6.6.118-android15). */
-static int vmid_off = 0;	/* u16 gunyah_vm.vmid   */
-static int rm_off   = 504;	/* struct gunyah_rm *gunyah_vm.rm */
+/* struct gunyah_vm private-layout offsets (BTF vmlinux.btf, 6.6.118-android15;
+ * unchanged on 6.12, whose additions all land after vm_status). */
+static int vmid_off      = 0;	/* u16 gunyah_vm.vmid   */
+static int rm_off        = 504;	/* struct gunyah_rm *gunyah_vm.rm */
+static int vm_status_off = 536;	/* enum gunyah_rm_vm_status gunyah_vm.vm_status */
 module_param(vmid_off, int, 0444);
 module_param(rm_off, int, 0444);
+module_param(vm_status_off, int, 0444);
+
+/*
+ * Namespace bit for the label we hand the RM.
+ *
+ * 6.12's in-tree driver started stamping parcel->label from the userspace region
+ * label (vm_mgr_mem.c, "parcel->label = b->label"); 6.6 left it 0 for every parcel
+ * it made. Our labels come from crosvm too, so from 6.12 on the two share one
+ * namespace and a collision means the RM sees two parcels of one VM under the same
+ * label -- a share refused, or worse a reclaim landing on the driver's parcel.
+ *
+ * Only the RM-facing copy is namespaced: the ioctl ABI, our (vm,label) table and
+ * every log line keep crosvm's own label, so nothing outside this file notices.
+ * The guest is unaffected -- it accepts by handle with validate_label=0.
+ * Applied on 6.6 as well: harmless there, and one code path beats two.
+ */
+#define GHSM_LABEL_NS	BIT(31)
+
+/* 6.12 added this terminal VM state; on 6.6 the enum stops short of it, so the
+ * comparison simply never fires there. */
+#define GHSM_VM_STATUS_RESET_FAILED	12
+
+/* Defined here rather than beside its siblings below because the reaper, which is
+ * the only caller, comes first in this file. Safe ONLY while the map still holds
+ * the VM's file -- see struct ghsm_map. */
+static inline u32 ghvm_status(void *ghvm)
+{
+	return *(u32 *)((u8 *)ghvm + vm_status_off);
+}
 
 /* ---- resolved-at-load symbols ---- */
 struct gunyah_rm;
@@ -141,6 +180,10 @@ struct ghsm_map {
 					 * touches a dead ghvm */
 	u32 label;
 	int retries;
+	bool reset_failed;		/* the VM's reset failed (6.12+): it will never
+					 * release the guest's accepts, so retrying the
+					 * reclaim is pointless. Latched while vm_file
+					 * still made ghvm safe to read. */
 	bool dying;			/* reclaim this parcel regardless of VM
 					 * liveness (explicit UNSHARE that the RM
 					 * refused, or VM found ownerless) */
@@ -236,7 +279,7 @@ static void ghsm_reaper(struct work_struct *work)
 				ours++;
 		if (file_count(m->vm_file) > ours)
 			continue;	/* crosvm still holds the VM fd */
-		pr_info("gunyah_share_66: VM of parcel label=%u is ownerless — reclaiming its parcels\n",
+		pr_info("VM of parcel label=%u is ownerless — reclaiming its parcels\n",
 			m->label);
 		list_for_each_entry(n, &ghsm_maps, node)
 			if (n->vm_file == m->vm_file)
@@ -250,16 +293,37 @@ static void ghsm_reaper(struct work_struct *work)
 
 		if (!m->dying || m->retries >= GHSM_REAP_MAX_TRIES)
 			continue;
+
+		/*
+		 * Read the VM's state while we still hold its file -- that ref is the
+		 * only thing keeping ghvm from being freed, and the first failed
+		 * reclaim drops it. A VM whose reset failed never releases the guest's
+		 * accepts, so the retry budget would be spent for nothing and end in
+		 * the same leak two minutes later. Latch it and give up now.
+		 */
+		if (m->vm_file && ghvm_status(m->ghvm) == GHSM_VM_STATUS_RESET_FAILED)
+			m->reset_failed = true;
+		if (m->reset_failed) {
+			pr_warn("VM of parcel label=%u failed to reset — giving up now, leaking %lu pinned pages\n",
+				label, npages);
+			m->retries = GHSM_REAP_MAX_TRIES;
+			if (m->vm_file) {
+				fput(m->vm_file);
+				m->vm_file = NULL;
+			}
+			continue;
+		}
+
 		list_del(&m->node);
 		if (ghsm_try_destroy(m) == 0) {
-			pr_info("gunyah_share_66: reaper reclaimed parcel label=%u pages=%lu\n",
+			pr_info("reaper reclaimed parcel label=%u pages=%lu\n",
 				label, npages);
 			continue;
 		}
 		m->retries++;
 		list_add_tail(&m->node, &ghsm_maps);
 		if (m->retries >= GHSM_REAP_MAX_TRIES)
-			pr_warn("gunyah_share_66: reaper giving up on parcel label=%u — leaking %lu pinned pages\n",
+			pr_warn("reaper giving up on parcel label=%u — leaking %lu pinned pages\n",
 				label, npages);
 	}
 
@@ -374,7 +438,7 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 	if (ret) goto free_m;
 
 	m->parcel.mem_type = GUNYAH_RM_MEM_TYPE_NORMAL;
-	m->parcel.label = label;
+	m->parcel.label = label | GHSM_LABEL_NS;
 	m->parcel.mem_handle = GUNYAH_MEM_HANDLE_INVAL;
 	m->parcel.n_acl_entries = 2;
 	m->parcel.acl_entries = kcalloc(2, sizeof(*m->parcel.acl_entries), GFP_KERNEL);
@@ -430,12 +494,12 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 			usleep_range(500, 1500);
 		}
 		if (ret) {
-			pr_err("gunyah_share_66: rm_mem_share label=%u ret=%d (after %d tries)\n",
+			pr_err("rm_mem_share label=%u ret=%d (after %d tries)\n",
 			       label, ret, tries);
 			goto free_entries;
 		}
 		if (tries)
-			pr_info("gunyah_share_66: share label=%u succeeded after %d retries\n",
+			pr_info("share label=%u succeeded after %d retries\n",
 				label, tries);
 	}
 
@@ -445,7 +509,7 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 	/* arm the liveness GC (no-op if already pending) */
 	schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
 	mutex_unlock(&ghsm_lock);
-	pr_info("gunyah_share_66: SHARE label=%u gpa_pages=%lu entries=%lu guest_vmid=%u handle=0x%x\n",
+	pr_info("SHARE label=%u gpa_pages=%lu entries=%lu guest_vmid=%u handle=0x%x\n",
 		label, npages, n_entries, guest_vmid, *out_handle);
 	return 0;
 
@@ -484,7 +548,7 @@ static int ghsm_unshare(void *ghvm, struct gunyah_rm *rm, u32 label)
 		 * unshares).  Keep the pages pinned and let the reaper retry
 		 * rather than freeing memory the hypervisor may still map.
 		 * dying=true also frees up (ghvm,label) for a re-share. */
-		pr_warn("gunyah_share_66: rm_mem_reclaim label=%u ret=%d — deferring to reaper\n",
+		pr_warn("rm_mem_reclaim label=%u ret=%d — deferring to reaper\n",
 			label, ret);
 		mutex_lock(&ghsm_lock);
 		m->retries = 0;
@@ -494,7 +558,7 @@ static int ghsm_unshare(void *ghvm, struct gunyah_rm *rm, u32 label)
 		mutex_unlock(&ghsm_lock);
 		return ret;
 	}
-	pr_info("gunyah_share_66: UNSHARE label=%u ret=0\n", label);
+	pr_info("UNSHARE label=%u ret=0\n", label);
 	return 0;
 }
 
@@ -591,7 +655,7 @@ static ssize_t gsp_write(struct file *f, const char __user *ub, size_t len, loff
 		if (!m) { kfree(pages); vfree(va); fput(vmf); return -ENOMEM; }
 		if (gunyah_rm_get_vmid(rm, &hvm)) { kfree(m); kfree(pages); vfree(va); fput(vmf); return -EIO; }
 		m->parcel.mem_type = GUNYAH_RM_MEM_TYPE_NORMAL;
-		m->parcel.label = label;
+		m->parcel.label = label | GHSM_LABEL_NS;
 		m->parcel.mem_handle = GUNYAH_MEM_HANDLE_INVAL;
 		m->parcel.n_acl_entries = 2;
 		m->parcel.acl_entries = kcalloc(2, sizeof(struct gunyah_rm_mem_acl_entry), GFP_KERNEL);
@@ -638,9 +702,9 @@ static int ghsm_outstanding_get(char *buf, const struct kernel_param *kp)
 		if (n > PAGE_SIZE - 128)
 			break;
 		n += sysfs_emit_at(buf, n,
-				   "label=%u pages=%lu dying=%d retries=%d vm_held=%d\n",
+				   "label=%u pages=%lu dying=%d retries=%d vm_held=%d reset_failed=%d\n",
 				   m->label, m->npages, m->dying, m->retries,
-				   !!m->vm_file);
+				   !!m->vm_file, m->reset_failed);
 	}
 	mutex_unlock(&ghsm_lock);
 	return n;
@@ -658,7 +722,7 @@ static int __init ghsm_init(void)
 	p_rm_mem_reclaim = (void *)lookup_name("gunyah_rm_mem_reclaim");
 	p_rm_get_vmid = (void *)lookup_name("gunyah_rm_get_vmid");
 	if (!p_rm_mem_share || !p_rm_mem_reclaim || !p_rm_get_vmid) {
-		pr_err("gunyah_share_66: cannot resolve gunyah_rm_mem_share/reclaim/get_vmid (gunyah loaded first?)\n");
+		pr_err("cannot resolve gunyah_rm_mem_share/reclaim/get_vmid (gunyah loaded first?)\n");
 		return -ENOENT;
 	}
 	/* Best-effort: without these, deferred reclaim relies on the RM device
@@ -671,7 +735,7 @@ static int __init ghsm_init(void)
 	ret = misc_register(&ghsm_dev);
 	if (ret) return ret;
 	ghsm_dbg = debugfs_create_file("gh_share_probe", 0200, NULL, NULL, &gsp_fops);
-	pr_info("gunyah_share_66: loaded v5/liveness-gc+share-retry (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
+	pr_info("loaded v5/liveness-gc+share-retry (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
 		p_rm_mem_share, p_rm_mem_reclaim, !!p_rm_get, vmid_off, rm_off);
 	return 0;
 }
@@ -717,7 +781,7 @@ static void __exit ghsm_exit(void)
 	 * memory a zombie VM's stage-2 may still map. */
 	list_for_each_entry_safe(m, tmp, &all, node) {
 		list_del(&m->node);
-		pr_warn("gunyah_share_66: unload: parcel label=%u unreclaimable — leaking %lu pinned pages\n",
+		pr_warn("unload: parcel label=%u unreclaimable — leaking %lu pinned pages\n",
 			m->label, m->npages);
 		if (p_rm_put)
 			p_rm_put(m->rm);
@@ -725,7 +789,7 @@ static void __exit ghsm_exit(void)
 		kfree(m->parcel.mem_entries); kfree(m);
 		leaked++;
 	}
-	pr_info("gunyah_share_66: unloaded (%d parcels leaked)\n", leaked);
+	pr_info("unloaded (%d parcels leaked)\n", leaked);
 }
 module_init(ghsm_init);
 module_exit(ghsm_exit);
