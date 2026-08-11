@@ -215,7 +215,7 @@ static void ghsm_map_free(struct ghsm_map *m)
 		p_rm_put(m->rm);
 	kvfree(m->pages);
 	kfree(m->parcel.acl_entries);
-	kfree(m->parcel.mem_entries);
+	kvfree(m->parcel.mem_entries);	/* kvcalloc'd in ghsm_share() */
 	kfree(m);
 }
 
@@ -457,8 +457,15 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 			n_entries++;
 	}
 	m->parcel.n_mem_entries = n_entries;
-	m->parcel.mem_entries = kcalloc(n_entries, sizeof(*m->parcel.mem_entries),
-					GFP_KERNEL_ACCOUNT);
+	/* kvcalloc for the same reason as pages[] above, and it is the harder case:
+	 * when coalescing fails (a fragmented host has no 2MB folios to collapse)
+	 * n_entries approaches npages, so a 128MB pool-grow step needs 32768 * 16B
+	 * = a 512KB order-7 contiguous kmalloc. That ENOMEMs on a long-uptime
+	 * fragmented host, and the failure surfaces far away: SHARE fails -> the
+	 * guest's gpu_guest pool cannot grow -> a large guest blob fails to
+	 * allocate -> GL_OUT_OF_MEMORY inside the guest app. Freed with kvfree. */
+	m->parcel.mem_entries = kvcalloc(n_entries, sizeof(*m->parcel.mem_entries),
+					 GFP_KERNEL_ACCOUNT);
 	if (!m->parcel.mem_entries) { ret = -ENOMEM; goto free_acl; }
 	entry = 0;
 	m->parcel.mem_entries[0].phys_addr = cpu_to_le64(page_to_phys(pages[0]));
@@ -514,7 +521,7 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 	return 0;
 
 free_entries:
-	kfree(m->parcel.mem_entries);
+	kvfree(m->parcel.mem_entries);
 free_acl:
 	kfree(m->parcel.acl_entries);
 free_m:
@@ -786,7 +793,7 @@ static void __exit ghsm_exit(void)
 		if (p_rm_put)
 			p_rm_put(m->rm);
 		kvfree(m->pages); kfree(m->parcel.acl_entries);
-		kfree(m->parcel.mem_entries); kfree(m);
+		kvfree(m->parcel.mem_entries); kfree(m);
 		leaked++;
 	}
 	pr_info("unloaded (%d parcels leaked)\n", leaked);
