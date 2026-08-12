@@ -135,6 +135,8 @@ static rm_mem_share_t p_rm_mem_share;
 static rm_mem_lend_t p_rm_mem_lend;
 static rm_mem_reclaim_t p_rm_mem_reclaim;
 static rm_get_vmid_t p_rm_get_vmid;
+/* Global in kallsyms but not exported on some 6.1 vendor kernels (OPPO 6.1.118). */
+static typeof(&account_locked_vm) p_account_locked_vm;
 
 typedef unsigned long (*kln_t)(const char *name);
 static kln_t kln;
@@ -188,6 +190,7 @@ static int resolve_symbols(void)
 	RESOLVE(p_rm_mem_lend, "gh_rm_mem_lend");
 	RESOLVE(p_rm_mem_reclaim, "gh_rm_mem_reclaim");
 	RESOLVE(p_rm_get_vmid, "gh_rm_get_vmid");
+	RESOLVE(p_account_locked_vm, "account_locked_vm");
 	return 0;
 }
 
@@ -224,7 +227,7 @@ static void ghsm_reclaim_mapping(struct gh_vm *ghvm, struct gh_vm_mem *mapping)
 
 	if (!ret) {
 		unpin_user_pages(mapping->pages, mapping->npages);
-		account_locked_vm(ghvm->mm, mapping->npages, false);
+		p_account_locked_vm(ghvm->mm, mapping->npages, false);
 	}
 
 	kvfree(mapping->pages);

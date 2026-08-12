@@ -119,6 +119,10 @@ struct gh_vm {
 
 /* gh_rm_mem_reclaim() is global but NOT exported, so resolve via kallsyms. */
 static int (*p_gh_rm_mem_reclaim)(struct gh_rm *rm, struct gh_rm_mem_parcel *parcel);
+/* Some 6.1 vendor kernels (e.g. OPPO 6.1.118) do not export these either,
+ * though both are global in kallsyms -- resolve them the same way. */
+static typeof(&account_locked_vm) p_account_locked_vm;
+static typeof(&gh_rm_get_vmid) p_gh_rm_get_vmid;
 
 static unsigned long (*p_kallsyms_lookup_name)(const char *name);
 
@@ -184,7 +188,7 @@ static void ghk_vm_mem_reclaim_mapping(struct gh_vm *ghvm, struct gh_vm_mem *map
 
 	if (!ret) {
 		unpin_user_pages(mapping->pages, mapping->npages);
-		account_locked_vm(ghvm->mm, mapping->npages, false);
+		p_account_locked_vm(ghvm->mm, mapping->npages, false);
 	}
 
 	kvfree(mapping->pages);
@@ -266,7 +270,7 @@ static int ghk_vm_mem_alloc(struct gh_vm *ghvm,
 	parcel->mem_handle = GH_MEM_HANDLE_INVAL; /* to be filled later by mem_share/mem_lend */
 	parcel->mem_type = GH_RM_MEM_TYPE_NORMAL;
 
-	ret = account_locked_vm(ghvm->mm, mapping->npages, true);
+	ret = p_account_locked_vm(ghvm->mm, mapping->npages, true);
 	if (ret)
 		goto free_mapping;
 
@@ -290,9 +294,11 @@ static int ghk_vm_mem_alloc(struct gh_vm *ghvm,
 					gup_flags, mapping->pages);
 	if (pinned < 0) {
 		ret = pinned;
+		pr_err("ghk: pin_user_pages_fast failed: %d (npages=%lu)\n", pinned, (unsigned long)mapping->npages);
 		goto free_pages;
 	} else if (pinned != mapping->npages) {
 		ret = -EFAULT;
+		pr_err("ghk: short pin %d of %lu\n", pinned, (unsigned long)mapping->npages);
 		mapping->npages = pinned; /* update npages for reclaim */
 		goto unpin_pages;
 	}
@@ -322,9 +328,11 @@ static int ghk_vm_mem_alloc(struct gh_vm *ghvm,
 		parcel->acl_entries[0].perms |= GH_RM_ACL_X;
 
 	if (!lend) {
-		ret = gh_rm_get_vmid(ghvm->rm, &vmid);
-		if (ret)
+		ret = p_gh_rm_get_vmid(ghvm->rm, &vmid);
+		if (ret) {
+			pr_err("ghk: gh_rm_get_vmid failed: %d\n", ret);
 			goto free_acl;
+		}
 
 		parcel->acl_entries[1].vmid = cpu_to_le16(vmid);
 		/* Host assumed to have all these permissions. Gunyah will not
@@ -377,7 +385,7 @@ unpin_pages:
 free_pages:
 	kvfree(mapping->pages);
 unlock_pages:
-	account_locked_vm(ghvm->mm, mapping->npages, false);
+	p_account_locked_vm(ghvm->mm, mapping->npages, false);
 free_mapping:
 	kfree(mapping);
 unlock:
@@ -424,6 +432,12 @@ static int __init ghk_init(void)
 	p_gh_rm_mem_reclaim = (void *)p_kallsyms_lookup_name("gh_rm_mem_reclaim");
 	if (!p_gh_rm_mem_reclaim) {
 		pr_err("could not resolve gh_rm_mem_reclaim\n");
+		return -ENOENT;
+	}
+	p_account_locked_vm = (void *)p_kallsyms_lookup_name("account_locked_vm");
+	p_gh_rm_get_vmid = (void *)p_kallsyms_lookup_name("gh_rm_get_vmid");
+	if (!p_account_locked_vm || !p_gh_rm_get_vmid) {
+		pr_err("could not resolve account_locked_vm/gh_rm_get_vmid\n");
 		return -ENOENT;
 	}
 
