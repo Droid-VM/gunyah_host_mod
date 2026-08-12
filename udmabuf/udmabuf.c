@@ -170,9 +170,6 @@ MODULE_PARM_DESC(stat_failed, "create attempts this module rejected (read-only).
 /* ------------------------------------------------------------------------- */
 
 static unsigned long (*ukv_lookup_name)(const char *name);
-/* Signature MUST match mm/memfd.c exactly: under CONFIG_CFI_CLANG a mismatched
- * indirect-call type is a fatal CFI violation (arg is unsigned long, not int). */
-static long (*ukv_memfd_fcntl)(struct file *file, unsigned int cmd, unsigned long arg);
 static int (*ukv_lookup_size_offset)(unsigned long addr, unsigned long *symbolsize,
 				     unsigned long *offset);
 
@@ -198,10 +195,6 @@ static unsigned long ukv_sym(const char *name)
 
 static void ukv_resolve_optional(void)
 {
-	/* Seals: upstream reads them with memfd_fcntl(), which modules cannot
-	 * link against.  SHMEM_I()->seals is the fallback, so a miss here only
-	 * costs us the layout-independent path, not the check. */
-	ukv_memfd_fcntl = (void *)ukv_sym("memfd_fcntl");
 	ukv_lookup_size_offset = (void *)ukv_sym("kallsyms_lookup_size_offset");
 }
 
@@ -410,13 +403,20 @@ static bool ukv_is_memfd(struct file *file)
 	return S_ISREG(inode->i_mode) && inode->i_sb->s_magic == TMPFS_MAGIC;
 }
 
-/** ukv_seals - F_GET_SEALS for a file already known to be a shmem memfd. */
+/** ukv_seals - F_GET_SEALS for a file already known to be a shmem memfd.
+ *
+ * Deliberately NOT via a kallsyms pointer to memfd_fcntl().  Its third
+ * parameter changed type upstream (unsigned long through 6.1, unsigned int
+ * from 6.6 on -- measured on GKI 6.1.118 / 6.6.118 / 6.12), and under
+ * CONFIG_CFI_CLANG an indirect call through the wrong prototype is a fatal
+ * violation: a hard SoC reset with no bark.  BOTH directions were hit on
+ * real devices -- the unsigned-int pointer reset SM8650 (6.1) on module
+ * use, and the "corrected" unsigned-long pointer reset SM8850 (6.12) on
+ * every VM launch.  SHMEM_I()->seals comes from this KMI's own headers at
+ * compile time, so it can never disagree with the running kernel.
+ * ukv_is_memfd() has already established the file is a shmem memfd. */
 static long ukv_seals(struct file *memfd)
 {
-	if (ukv_memfd_fcntl)
-		return ukv_memfd_fcntl(memfd, F_GET_SEALS, 0);
-	/* memfd_fcntl is unavailable: read the seals out of the shmem inode
-	 * directly.  ukv_is_memfd() has already established this is one. */
 	return SHMEM_I(file_inode(memfd))->seals;
 }
 
