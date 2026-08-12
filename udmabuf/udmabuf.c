@@ -64,6 +64,7 @@
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/init.h>
+#include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/magic.h>
@@ -147,6 +148,17 @@ module_param_cb(size_limit_mb, &ukv_limit_ops, &size_limit_mb, 0644);
 MODULE_PARM_DESC(size_limit_mb,
 	"Max size of a dmabuf, in megabytes. Default 4096 (clamped to 2047 when pushed into the built-in driver).");
 
+/* LTO renaming escape hatch (see ukv_sym_named): the loader may pass the
+ * kallsyms names it found for the built-in's static symbols. */
+static char *sym_create = "";
+module_param(sym_create, charp, 0444);
+MODULE_PARM_DESC(sym_create,
+	"kallsyms name of the built-in udmabuf_create when LTO renamed it (default: exact name).");
+static char *sym_ioctl = "";
+module_param(sym_ioctl, charp, 0444);
+MODULE_PARM_DESC(sym_ioctl,
+	"kallsyms name of the built-in udmabuf_ioctl when LTO renamed it (default: exact name).");
+
 static char *force_mode = "auto";
 module_param(force_mode, charp, 0444);
 MODULE_PARM_DESC(force_mode,
@@ -191,6 +203,43 @@ static void ukv_resolve_lookup_name(void)
 static unsigned long ukv_sym(const char *name)
 {
 	return ukv_lookup_name ? ukv_lookup_name(name) : 0;
+}
+
+/**
+ * ukv_sym_named - resolve NAME, honouring a userspace-supplied override.
+ * @name:    the symbol as written in the source (e.g. "udmabuf_create").
+ * @override: module parameter carrying the name it really goes by ("" = none).
+ * @actual:  buffer that receives the name that resolved; needed for
+ *           register_kprobe(), whose .symbol_name does its own exact lookup.
+ * @sz:      size of @actual.
+ *
+ * ThinLTO builds can rename a static function to "name.llvm.<hash>", making
+ * the exact kallsyms lookup miss and a present built-in driver look absent --
+ * which would silently demote this module to the wrong mode.  The module
+ * cannot scan /proc/kallsyms itself (kernel_read is a protected GKI export;
+ * filp_open is not exported at all on 6.12), but userspace can read it
+ * freely: the loader greps for "name.<anything>" and passes what it found in
+ * sym_create= / sym_ioctl=.  Exact lookup still runs first so a wrong or
+ * stale override never masks a symbol that resolves by its real name.
+ */
+static unsigned long ukv_sym_named(const char *name, const char *override,
+				   char *actual, size_t sz)
+{
+	unsigned long addr = ukv_sym(name);
+
+	strscpy(actual, name, sz);
+	if (!addr && override && override[0]) {
+		addr = ukv_sym(override);
+		if (addr) {
+			strscpy(actual, override, sz);
+			pr_info("%s resolved via loader override as \"%s\"\n",
+				name, override);
+		} else {
+			pr_warn("loader override \"%s\" for %s does not resolve either\n",
+				override, name);
+		}
+	}
+	return addr;
 }
 
 static void ukv_resolve_optional(void)
@@ -680,8 +729,11 @@ static int ukv_pre_create(struct kprobe *p, struct pt_regs *regs)
 	return 1;	/* do not execute the probed instruction */
 }
 
+/* Filled by ukv_pick_mode(): the name udmabuf_create really goes by in this
+ * kernel's kallsyms (LTO may have renamed it -- see ukv_sym_named). */
+static char ukv_create_name[KSYM_NAME_LEN] = "udmabuf_create";
 static struct kprobe ukv_kp_create = {
-	.symbol_name = "udmabuf_create",
+	.symbol_name = ukv_create_name,
 	.pre_handler = ukv_pre_create,
 };
 
@@ -715,8 +767,9 @@ static int ukv_pre_ioctl(struct kprobe *p, struct pt_regs *regs)
 	return 1;
 }
 
+static char ukv_ioctl_name[KSYM_NAME_LEN] = "udmabuf_ioctl";
 static struct kprobe ukv_kp_ioctl = {
-	.symbol_name = "udmabuf_ioctl",
+	.symbol_name = ukv_ioctl_name,
 	.pre_handler = ukv_pre_ioctl,
 };
 
@@ -935,13 +988,26 @@ static enum ukv_mode ukv_pick_mode(void)
 
 	/* The built-in driver's own static symbols.  Ours are all ukv_*, so
 	 * these can only ever match the kernel's (or a loaded udmabuf.ko's). */
-	create = ukv_sym("udmabuf_create");
-	if (!create && !ukv_sym("udmabuf_ops")) {
-		/* No provider we can see.  If one exists anyway (kallsyms is
-		 * unavailable, say), misc_register will tell us by failing. */
-		pr_info("no built-in udmabuf found\n");
-		return UKV_NATIVE;
+	create = ukv_sym_named("udmabuf_create", sym_create, ukv_create_name,
+			       sizeof(ukv_create_name));
+	if (create) {
+		/* Resolve the ioctl hook's real name too while we are at it;
+		 * a miss just keeps the exact name and the hook degrades as
+		 * before (built-in list copy + its own list_limit). */
+		ukv_sym_named("udmabuf_ioctl", sym_ioctl, ukv_ioctl_name,
+			      sizeof(ukv_ioctl_name));
+	} else {
+		char opsbuf[KSYM_NAME_LEN];
+
+		if (!ukv_sym_named("udmabuf_ops", "", opsbuf, sizeof(opsbuf))) {
+			/* No provider we can see.  If one exists anyway
+			 * (kallsyms is unavailable, say), misc_register will
+			 * tell us by failing. */
+			pr_info("no built-in udmabuf found\n");
+			return UKV_NATIVE;
+		}
 	}
+
 
 	if (UKV_FOLIO_ERA || ukv_sym("memfd_pin_folios")) {
 		/* The folio-based built-in (>= 6.10) does carry the kvmalloc fix,
@@ -1055,6 +1121,14 @@ static int __init ukv_init(void)
 		ukv_builtin_list_limit.managed = true;
 		ukv_push_builtin_limits();
 		pr_info("mode=paramonly: built-in driver left in charge, its limits raised\n");
+		/* Not just informational on a folio kernel: that built-in's page
+		 * collection mis-binds large shmem folios (GPU imports read the
+		 * wrong pages -- CP opcode-0 faults, measured on SM8850/6.12),
+		 * and in this mode nothing stands in for it.  Reached only when
+		 * the create hook failed or the mode was forced, so say it
+		 * loudly enough to be found from a GPU-fault report. */
+		if (UKV_FOLIO_ERA || ukv_sym("memfd_pin_folios"))
+			pr_err("folio built-in left serving: GPU imports over large folios WILL mis-bind (known DEVICE_LOST source); override mode was not possible here\n");
 	}
 
 	ukv_set_mode(m);
