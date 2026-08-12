@@ -8,18 +8,22 @@
  *               /dev/udmabuf ourselves.  The driver below is the upstream one,
  *               version-gated for 6.1 / 6.6+, with the page-pointer array
  *               allocated by kvmalloc from the start.
- *   override  - built-in provider present but UNFIXED (allocates the
- *               page-pointer array with kmalloc_array, so a 128 MiB dma-buf
- *               needs a contiguous order-6 allocation and fails once memory is
- *               fragmented - the bug fixed upstream for the folio driver as
- *               CVE-2024-56544).  A kprobe redirects the built-in
- *               udmabuf_create() to ours.
- *   paramonly - built-in provider present and already fixed (or too new / not
- *               safely hookable): leave its code alone and only raise its two
- *               tunables, size_limit_mb and list_limit.  Upstream's 64 MiB
- *               default is far below what a VkDeviceMemory blob needs now that
- *               they travel as dma-bufs, so "already fixed" is not the same as
- *               "needs nothing from us".
+ *   override  - built-in provider present but UNSUITABLE.  Two known eras:
+ *               the kmalloc era (page-pointer array via kmalloc_array, so a
+ *               128 MiB dma-buf needs a contiguous order-6 allocation and
+ *               fails once memory is fragmented - fixed upstream for the
+ *               folio driver as CVE-2024-56544), and the folio era (>= 6.10,
+ *               memfd_pin_folios page collection mis-binds large shmem
+ *               folios: over our order-9 reserve folios the GPU gets
+ *               different pages than the CPU - measured on SM8850/6.12 as
+ *               CP opcode-0 hard faults).  A kprobe redirects the built-in
+ *               udmabuf_create() to ours in both eras.
+ *   paramonly - built-in provider present, suitable, or not safely hookable:
+ *               leave its code alone and only raise its two tunables,
+ *               size_limit_mb and list_limit.  Upstream's 64 MiB default is
+ *               far below what a VkDeviceMemory blob needs now that they
+ *               travel as dma-bufs, so "suitable" is not the same as "needs
+ *               nothing from us".
  *
  * The override replacement returns a dma_buf that is entirely OURS - our
  * dma_buf_ops, our private struct - so the built-in driver's own ops never see
@@ -940,7 +944,22 @@ static enum ukv_mode ukv_pick_mode(void)
 	}
 
 	if (UKV_FOLIO_ERA || ukv_sym("memfd_pin_folios")) {
-		pr_info("built-in udmabuf is the folio-based driver (>= 6.10), which carries the fix\n");
+		/* The folio-based built-in (>= 6.10) does carry the kvmalloc fix,
+		 * but its memfd_pin_folios() page collection mis-binds large shmem
+		 * folios: a udmabuf built over one of our order-9 reserve folios
+		 * hands the GPU different pages than the CPU sees.  Measured on
+		 * SM8850 (kernel 6.12, Adreno 840): the CP fetches zeros from a
+		 * cmdstream BO that reads back correctly host-side -> opcode-0
+		 * hard fault -> DEVICE_LOST for every second-and-later context,
+		 * while the same stack works with our create path (force_mode=
+		 * override).  So the folio era gets the same treatment as the
+		 * unfixed kmalloc era: replace udmabuf_create outright.
+		 */
+		if (create) {
+			pr_info("built-in udmabuf is the folio-based driver (>= 6.10); overriding: its large-folio page collection mis-binds 2MB reserve folios\n");
+			return UKV_OVERRIDE;
+		}
+		pr_info("folio-based built-in udmabuf but udmabuf_create is not in kallsyms; cannot hook\n");
 		return UKV_PARAMONLY;
 	}
 
