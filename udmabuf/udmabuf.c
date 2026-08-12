@@ -166,7 +166,9 @@ MODULE_PARM_DESC(stat_failed, "create attempts this module rejected (read-only).
 /* ------------------------------------------------------------------------- */
 
 static unsigned long (*ukv_lookup_name)(const char *name);
-static long (*ukv_memfd_fcntl)(struct file *file, unsigned int cmd, unsigned int arg);
+/* Signature MUST match mm/memfd.c exactly: under CONFIG_CFI_CLANG a mismatched
+ * indirect-call type is a fatal CFI violation (arg is unsigned long, not int). */
+static long (*ukv_memfd_fcntl)(struct file *file, unsigned int cmd, unsigned long arg);
 static int (*ukv_lookup_size_offset)(unsigned long addr, unsigned long *symbolsize,
 				     unsigned long *offset);
 
