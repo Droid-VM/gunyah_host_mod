@@ -92,14 +92,19 @@ print(f"OK: {len(pages)} page(s) -> {dst}")
 EOF
 }
 
-# Stage match.json -- which devices each module is FOR. The KMI directory already says
-# which kernel a .ko was built for; this says which SoC it makes sense on, so a Gunyah
-# module stays off a MediaTek phone (and a MediaTek module, when one exists, stays off a
-# Snapdragon). Rules are keyed by module-name prefix, same convention as descr/. The app
-# reads it from usr/lib/modules/match.json; see the app's KernelModuleMatch for the schema.
+# Stage match.json -- which devices each module is FOR, and what its card is titled. The
+# KMI directory already says which kernel a .ko was built for; the "modules" rules say
+# which SoC it makes sense on, so a Gunyah module stays off a MediaTek phone (and a
+# MediaTek module, when one exists, stays off a Snapdragon). The "names" section maps the
+# same module-name prefixes to display names (top-level, NOT a rule field: older apps
+# fail a rule with a field they cannot judge, but ignore extra top-level keys). Rules and
+# names are keyed by module-name prefix, same convention as descr/. The app reads it from
+# usr/lib/modules/match.json; see the app's KernelModuleMatch for the schema.
 #
 # Every module built here must have a rule: an unmatched .ko is not listed at all, so a
-# missing rule silently deletes a module from the UI. Fail the build instead.
+# missing rule silently deletes a module from the UI. Fail the build instead. Names are
+# optional (the app falls back to the name minus its _gki_X.Y tag), but a names key that
+# covers no built .ko is a typo silently showing users the fallback -- fail on that too.
 stage_match() {
   echo ">>> staging match.json"
   mkdir -p "${OUT}"
@@ -107,16 +112,21 @@ stage_match() {
   python3 - "${OUT}" <<'EOF'
 import json, pathlib, sys
 out = pathlib.Path(sys.argv[1])
-rules = json.loads((out / "match.json").read_text(encoding="utf-8"))["modules"]
-missing = []
-for ko in sorted(out.glob("*/*.ko")):
-    # Kbuild turns '-' into '_' in the loaded name; that is what the app matches on.
-    name = ko.stem.replace("-", "_")
-    if not any(name.startswith(k) for k in rules):
-        missing.append(name)
+data = json.loads((out / "match.json").read_text(encoding="utf-8"))
+rules = data["modules"]
+# Kbuild turns '-' into '_' in the loaded name; that is what the app matches on.
+kos = sorted({ko.stem.replace("-", "_") for ko in out.glob("*/*.ko")})
+missing = [n for n in kos if not any(n.startswith(k) for k in rules)]
 if missing:
-    sys.exit(f"match.json: no rule covers {sorted(set(missing))}")
-print(f"OK: {len(rules)} rule(s) -> {out}/match.json")
+    sys.exit(f"match.json: no rule covers {missing}")
+names = data.get("names", {})
+bad = [k for k, v in names.items() if not isinstance(v, str) or not v.strip()]
+if bad:
+    sys.exit(f"match.json: names must be non-empty strings: {sorted(bad)}")
+stray = [k for k in names if not any(n.startswith(k) for n in kos)]
+if stray:
+    sys.exit(f"match.json: names for no built module (typo?): {sorted(stray)}")
+print(f"OK: {len(rules)} rule(s), {len(names)} name(s) -> {out}/match.json")
 EOF
 }
 
