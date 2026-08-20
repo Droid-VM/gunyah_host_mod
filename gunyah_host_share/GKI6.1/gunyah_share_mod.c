@@ -238,6 +238,163 @@ static void ghsm_reclaim_mapping(struct gh_vm *ghvm, struct gh_vm_mem *mapping)
 }
 
 /*
+ * Same reclaim, but the mapping survives a refusal.
+ *
+ * ghsm_reclaim_mapping() is the in-tree helper verbatim, and the in-tree helper is only ever
+ * called from teardown, where dropping a parcel the RM refused to reclaim costs nothing: the VM
+ * is going away anyway. The reaper below calls it while the VM is still alive, so a refusal must
+ * leave the mapping exactly as it was -- on the VM's list, pages pinned, parcel handle intact --
+ * for the in-tree teardown to deal with. Returns the RM's error, 0 if the parcel is gone.
+ */
+static int ghsm_reclaim_mapping_if_free(struct gh_vm *ghvm, struct gh_vm_mem *mapping)
+{
+	int ret;
+
+	if (mapping->parcel.mem_handle == GH_MEM_HANDLE_INVAL)
+		return 0;
+
+	ret = p_rm_mem_reclaim(ghvm->rm, &mapping->parcel);
+	if (ret)
+		return ret;
+
+	unpin_user_pages(mapping->pages, mapping->npages);
+	p_account_locked_vm(ghvm->mm, mapping->npages, false);
+	kvfree(mapping->pages);
+	kfree(mapping->parcel.acl_entries);
+	kvfree(mapping->parcel.mem_entries);
+	list_del(&mapping->list);
+	kfree(mapping);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Liveness GC: reclaim a dead crosvm's blobs before the VM tears down */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Ported from the 6.6/6.12 copy of this module, which needs it because it owns its parcels
+ * outright. This copy does not: every blob goes through the driver's own gh_vm_mem_alloc(), so
+ * it sits on ghvm->memory_mappings and the in-tree gh_vm_free() -> gh_vm_mem_reclaim() already
+ * reclaims it when the VM object dies. What that path does NOT do is get there promptly: it
+ * first calls gh_rm_vm_reset() and then waits, unconditionally, for the RM to report RESET --
+ *
+ *     ret = gh_rm_vm_reset(ghvm->rm, ghvm->vmid);
+ *     if (ret) dev_err(ghvm->parent, "Failed to reset the vm: %d\n", ret);
+ *     wait_event(ghvm->vm_status_wait, ghvm->vm_status == GH_RM_VM_STATUS_RESET);
+ *
+ * (drivers/virt/gunyah/vm_mgr.c, 6.1) -- so a VM that will not reset takes a kernel worker with
+ * it and never reaches the reclaim. Clearing our SHAREs first is the one thing this module can
+ * do about that, and it is worth doing on its own: a blob the guest already unmapped is pure
+ * leftovers, and returning it costs nothing.
+ *
+ * Two things the 6.6 copy does are deliberately absent here:
+ *   - no post-refusal retry. There, a cached rm reference lets a reclaim be retried after the
+ *     VM file ref is dropped; here the parcel can only be reached through ghvm, which is only
+ *     safe to touch while we hold that ref -- and holding it is exactly what stops the reset
+ *     that would release the guest's accepts. So: one attempt, then get out of the way.
+ *   - no RESET_FAILED latch. That state (12) does not exist in this kernel's enum, which stops
+ *     at GH_RM_VM_STATUS_RESET = 11.
+ */
+struct ghsm_blob {
+	struct list_head node;
+	struct gh_vm *ghvm;	/* only dereferenced while vm_file is held */
+	struct file *vm_file;	/* our ref; delays gh_vm_release() until we are done */
+	u32 label;
+};
+
+static LIST_HEAD(ghsm_blobs);
+static DEFINE_MUTEX(ghsm_blob_lock);
+
+#define GHSM_REAP_INTERVAL msecs_to_jiffies(2000)
+
+static void ghsm_reaper(struct work_struct *work);
+static DECLARE_DELAYED_WORK(ghsm_reaper_work, ghsm_reaper);
+
+/* Caller holds no locks. Takes a ref on the VM file that the reaper releases. */
+static void ghsm_track(struct gh_vm *ghvm, struct file *vm_file, u32 label)
+{
+	struct ghsm_blob *b = kzalloc(sizeof(*b), GFP_KERNEL);
+
+	if (!b) {
+		pr_warn("cannot track label=%u (no memory); it will only be reclaimed at VM teardown\n",
+			label);
+		return;
+	}
+	b->ghvm = ghvm;
+	b->vm_file = get_file(vm_file);
+	b->label = label;
+
+	mutex_lock(&ghsm_blob_lock);
+	list_add_tail(&b->node, &ghsm_blobs);
+	mutex_unlock(&ghsm_blob_lock);
+
+	schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
+}
+
+static void ghsm_untrack(struct gh_vm *ghvm, u32 label)
+{
+	struct ghsm_blob *b, *tmp;
+
+	mutex_lock(&ghsm_blob_lock);
+	list_for_each_entry_safe(b, tmp, &ghsm_blobs, node) {
+		if (b->ghvm != ghvm || b->label != label)
+			continue;
+		list_del(&b->node);
+		fput(b->vm_file);
+		kfree(b);
+		break;
+	}
+	mutex_unlock(&ghsm_blob_lock);
+}
+
+/*
+ * Liveness signal, same as the 6.6 copy: every tracked blob holds a get_file() on its VM's
+ * file, so once file_count() is down to just our own refs, every crosvm fd to that VM is gone.
+ * Keyed on the VM file and not on /dev/gunyah_share, which crosvm opens afresh for each ioctl.
+ */
+static void ghsm_reaper(struct work_struct *work)
+{
+	struct ghsm_blob *b, *tmp, *n;
+	bool rearm = false;
+
+	mutex_lock(&ghsm_blob_lock);
+	list_for_each_entry_safe(b, tmp, &ghsm_blobs, node) {
+		struct gh_vm *ghvm = b->ghvm;
+		struct gh_vm_mem *mapping;
+		u32 label = b->label;
+		long ours = 0;
+		int ret;
+
+		list_for_each_entry(n, &ghsm_blobs, node)
+			if (n->vm_file == b->vm_file)
+				ours++;
+		if (file_count(b->vm_file) > ours) {
+			rearm = true;	/* crosvm still holds the VM fd */
+			continue;
+		}
+
+		mutex_lock(&ghvm->mm_lock);
+		mapping = ghsm_find_by_label(ghvm, label);
+		ret = mapping ? ghsm_reclaim_mapping_if_free(ghvm, mapping) : 0;
+		mutex_unlock(&ghvm->mm_lock);
+
+		if (ret)
+			pr_warn("crosvm is gone but the RM still refuses label=%u (%d) — leaving it to VM teardown\n",
+				label, ret);
+		else
+			pr_info("crosvm is gone; reclaimed label=%u%s\n", label,
+				mapping ? "" : " (already gone)");
+
+		list_del(&b->node);
+		fput(b->vm_file);
+		kfree(b);
+	}
+	if (rearm)
+		schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
+	mutex_unlock(&ghsm_blob_lock);
+}
+
+/*
  * Reclaim a single blob by label: gh_rm_mem_reclaim + unpin + drop from the
  * VM's list. Called from the GHSM_UNSHARE_BLOB ioctl when the guest has unmapped
  * the blob (and already released its own stage-2 acceptance). Caller must NOT
@@ -385,6 +542,8 @@ static long ghsm_dev_ioctl(struct file *filp, unsigned int cmd,
 		}
 
 		r = ghsm_unshare_by_label(ghvm, u.label);
+		if (r == 0 || r == -ENOENT)
+			ghsm_untrack(ghvm, u.label);
 		fput(vmf);
 		return r;
 	}
@@ -418,6 +577,10 @@ static long ghsm_dev_ioctl(struct file *filp, unsigned int cmd,
 	r = ghsm_mem_share_blob(ghvm, &region, &blob.mem_handle);
 	if (r)
 		goto out;
+
+	/* Tracked from here on, so that a crosvm that dies without unsharing does not leave the
+	 * parcel for the VM teardown path to trip over. */
+	ghsm_track(ghvm, vmf, blob.label);
 
 	if (copy_to_user(argp, &blob, sizeof(blob)))
 		r = -EFAULT;
@@ -584,14 +747,30 @@ static int __init ghsm_init(void)
 	gsp_dent = debugfs_create_file("gh_share_probe", 0200, NULL, NULL,
 				       &gsp_fops);
 
-	pr_info("loaded. /dev/gunyah_share ready; probe: echo \"<vm_fd> <size_hex> [1=LEND|2=SHARE]\" > /sys/kernel/debug/gh_share_probe\n");
+	pr_info("loaded (v2: liveness GC for a dead crosvm's blobs). /dev/gunyah_share ready; probe: echo \"<vm_fd> <size_hex> [1=LEND|2=SHARE]\" > /sys/kernel/debug/gh_share_probe\n");
 	return 0;
 }
 
 static void __exit ghsm_exit(void)
 {
+	struct ghsm_blob *b, *tmp;
+
 	debugfs_remove(gsp_dent);
 	misc_deregister(&ghsm_misc);
+
+	/* Drop the VM file refs without reclaiming: unloading this module is not a reason to take
+	 * a parcel away from a VM that may still be using it, and holding the refs would keep
+	 * those VMs from ever tearing down. Their parcels go back through gh_vm_free() as they
+	 * always did before the reaper existed. */
+	cancel_delayed_work_sync(&ghsm_reaper_work);
+	mutex_lock(&ghsm_blob_lock);
+	list_for_each_entry_safe(b, tmp, &ghsm_blobs, node) {
+		list_del(&b->node);
+		fput(b->vm_file);
+		kfree(b);
+	}
+	mutex_unlock(&ghsm_blob_lock);
+
 	pr_info("unloaded\n");
 }
 
