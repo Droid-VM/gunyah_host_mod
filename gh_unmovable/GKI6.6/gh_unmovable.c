@@ -215,24 +215,178 @@ static struct miscdevice ghu_dev = {
 	.mode  = 0666,
 };
 
+/* ------------------------------------------------------------------ */
+/* /dev/gh_pinprobe -- read-only "can this range be long-term pinned?"  */
+/* ------------------------------------------------------------------ */
+/*
+ * Why a probe and not just a pin: every gunyah memory transfer (boot LEND of guest RAM,
+ * boot SHARE of the GPU pools, runtime SHARE of a blob) ends in
+ * pin_user_pages_fast(FOLL_LONGTERM). A page in a CMA (or isolate, or ZONE_MOVABLE)
+ * pageblock cannot be pinned that way -- the kernel migrates it out first, and when there
+ * is nothing to migrate into, that step fails deep inside the hypervisor call. Observed
+ * outcomes of failing there: a multi-minute whole-host stall ending in the kernel
+ * OOM-killing crosvm, and a "qcom_scm: Assign memory protection call failed -22" that
+ * reset the phone.
+ *
+ * As long as the gh_hugepage reserve serves the whole region this never arises (its folios
+ * are already pinnable). So the useful question at the decision point is not "pin it" but
+ * "is any of it in a pageblock that would need migrating?" -- which is a property of the
+ * pages, readable without taking a long-term reference, without migrating anything, and
+ * without any of the reclaim pressure that makes the real thing dangerous.
+ *
+ * Sampling: migratetype is a per-pageblock property (pageblock is >= 2MB on every config
+ * here), and the caller's regions are built out of 2MB folios, so one sample per 2MB
+ * covers every pageblock in the range. get_user_pages_fast() with no flags takes an
+ * ordinary short-lived page reference -- never FOLL_LONGTERM, so it never migrates -- and
+ * we drop it immediately. Absent pages are counted separately rather than faulted in and
+ * counted as good.
+ */
+#define GH_PINPROBE_IOC_MAGIC 'P'
+
+struct gh_pinprobe_range {
+	__u64 addr;		/* in:  user VA (page aligned) */
+	__u64 len;		/* in:  bytes */
+	__u64 samples;		/* out: pageblock samples taken */
+	__u64 samples_cma;	/* out: samples in a MIGRATE_CMA pageblock */
+	__u64 samples_isolate;	/* out: samples in a MIGRATE_ISOLATE pageblock */
+	__u64 samples_movable;	/* out: samples in ZONE_MOVABLE */
+	__u64 samples_absent;	/* out: samples with no page present */
+	__u64 first_bad_offset;	/* out: byte offset of the first unpinnable sample, ~0 if none */
+	__u32 sample_bytes;	/* out: distance between samples */
+	__u32 flags;		/* in/out: reserved, must be 0 */
+};
+
+#define GH_PINPROBE_RANGE _IOWR(GH_PINPROBE_IOC_MAGIC, 1, struct gh_pinprobe_range)
+
+#define GHP_SAMPLE_BYTES (2UL << 20)	/* one sample per 2MB */
+
+/* Returns 1 if a page in this state would force migration before a FOLL_LONGTERM pin. */
+static bool ghp_classify(struct page *page, struct gh_pinprobe_range *r)
+{
+	bool bad = false;
+	int mt;
+
+	mt = get_pageblock_migratetype(page);
+#ifdef CONFIG_CMA
+	if (mt == MIGRATE_CMA) {
+		r->samples_cma++;
+		bad = true;
+	}
+#endif
+#ifdef CONFIG_MEMORY_ISOLATION
+	if (mt == MIGRATE_ISOLATE) {
+		r->samples_isolate++;
+		bad = true;
+	}
+#endif
+	if (page_zonenum(page) == ZONE_MOVABLE) {
+		r->samples_movable++;
+		bad = true;
+	}
+	return bad;
+}
+
+static long ghp_probe(unsigned long arg)
+{
+	struct gh_pinprobe_range r;
+	unsigned long off, end;
+	long ret = 0;
+
+	if (copy_from_user(&r, (void __user *)arg, sizeof(r)))
+		return -EFAULT;
+	if (!r.len || r.flags || (r.addr & ~PAGE_MASK))
+		return -EINVAL;
+
+	end = r.len;
+	r.samples = 0;
+	r.samples_cma = 0;
+	r.samples_isolate = 0;
+	r.samples_movable = 0;
+	r.samples_absent = 0;
+	r.first_bad_offset = ~0ULL;
+	r.sample_bytes = GHP_SAMPLE_BYTES;
+
+	for (off = 0; off < end; off += GHP_SAMPLE_BYTES) {
+		unsigned long va = (unsigned long)r.addr + off;
+		struct page *page = NULL;
+		int got;
+
+		if (fatal_signal_pending(current))
+			return -EINTR;
+
+		/* No flags: an ordinary reference, never FOLL_LONGTERM, so this cannot
+		 * migrate anything -- which is the whole point of asking here. */
+		got = get_user_pages_fast(va, 1, 0, &page);
+		if (got != 1) {
+			r.samples_absent++;
+			r.samples++;
+			continue;
+		}
+		r.samples++;
+		if (ghp_classify(page, &r) && r.first_bad_offset == ~0ULL)
+			r.first_bad_offset = off;
+		put_page(page);
+		cond_resched();
+	}
+
+	if (copy_to_user((void __user *)arg, &r, sizeof(r)))
+		ret = -EFAULT;
+	return ret;
+}
+
+static long ghp_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	switch (cmd) {
+	case GH_PINPROBE_RANGE:
+		return ghp_probe(arg);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations ghp_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= ghp_ioctl,
+	.compat_ioctl	= ghp_ioctl,
+	.llseek		= noop_llseek,
+};
+
+static struct miscdevice ghp_dev = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = "gh_pinprobe",
+	.fops  = &ghp_fops,
+	.mode  = 0666,
+};
+
 static int __init ghu_init(void)
 {
 	int ret = misc_register(&ghu_dev);
 
-	if (ret)
+	if (ret) {
 		pr_err("gh_unmovable: misc_register failed: %d\n", ret);
+		return ret;
+	}
+	pr_info("gh_unmovable: /dev/gh_unmovable ready (non-movable pinnable mem)\n");
+
+	/* Independent node, independent fops: the probe answers a different question and
+	 * shares no state with the allocator above. Its absence must not take the
+	 * allocator with it, so a failure here is a warning, not an error. */
+	ret = misc_register(&ghp_dev);
+	if (ret)
+		pr_warn("gh_unmovable: /dev/gh_pinprobe unavailable: %d\n", ret);
 	else
-		pr_info("gh_unmovable: /dev/gh_unmovable ready (non-movable pinnable mem)\n");
-	return ret;
+		pr_info("gh_unmovable: /dev/gh_pinprobe ready (longterm-pinnability probe)\n");
+	return 0;
 }
 
 static void __exit ghu_exit(void)
 {
+	misc_deregister(&ghp_dev);
 	misc_deregister(&ghu_dev);
 }
 
 module_init(ghu_init);
 module_exit(ghu_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("DroidVM: non-movable FOLL_LONGTERM-pinnable userspace memory for small GPU blobs");
+MODULE_DESCRIPTION("DroidVM: non-movable pinnable memory (/dev/gh_unmovable) + longterm-pinnability probe (/dev/gh_pinprobe)");
 MODULE_AUTHOR("DroidVM");
