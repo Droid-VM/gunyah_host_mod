@@ -236,11 +236,29 @@ static struct miscdevice ghu_dev = {
  *
  * Sampling: migratetype is a per-pageblock property (pageblock is >= 2MB on every config
  * here), and the caller's regions are built out of 2MB folios, so one sample per 2MB
- * covers every pageblock in the range. get_user_pages_fast() with no flags takes an
- * ordinary short-lived page reference -- never FOLL_LONGTERM, so it never migrates -- and
- * we drop it immediately. Absent pages are counted separately rather than faulted in and
- * counted as good.
+ * covers every pageblock in the range. The reference taken is short-lived and never
+ * FOLL_LONGTERM, so nothing is migrated, and it is dropped immediately.
+ *
+ * It is also FOLL_NOFAULT, and that matters as much as the rest: get_user_pages() with no
+ * flags FAULTS AN ABSENT PAGE IN. Asked about a region that has not been populated yet,
+ * this probe therefore used to populate it -- one 4 KB page per 2 MB sample, order-0,
+ * which the gh_hugepage reserve's hook does not intercept (it replaces order-9
+ * allocations only). Those pages came from the buddy allocator, could land in CMA, and
+ * were then dutifully reported as unpinnable: the probe was measuring what it had itself
+ * just created, and no amount of waiting could clear it. Looking without populating is the
+ * whole contract here. Absent pages are counted separately, never faulted in.
  */
+/*
+ * "Look, do not populate." FOLL_NOFAULT is 5.17+ and public on every KMI this module is
+ * built for (6.1, 6.6, 6.12) -- a macro on 6.1 and an enumerator from 6.5, which is why
+ * this is used unconditionally rather than guarded with #ifdef: the guard would silently
+ * miss the enum. FOLL_FAST_ONLY would say the same thing, but it moved into mm/internal.h
+ * in 6.5 and is not available to a module at all. If some future kernel refuses the flag,
+ * every sample comes back absent -- which reads as "I could not tell", not as a false
+ * all-clear -- and the module says so once in the log.
+ */
+#define GHP_FOLL_LOOK_ONLY FOLL_NOFAULT
+
 #define GH_PINPROBE_IOC_MAGIC 'P'
 
 struct gh_pinprobe_range {
@@ -289,6 +307,7 @@ static bool ghp_classify(struct page *page, struct gh_pinprobe_range *r)
 static long ghp_probe(unsigned long arg)
 {
 	struct gh_pinprobe_range r;
+	unsigned int gup_flags;
 	unsigned long off, end;
 	long ret = 0;
 
@@ -303,6 +322,7 @@ static long ghp_probe(unsigned long arg)
 	r.samples_isolate = 0;
 	r.samples_movable = 0;
 	r.samples_absent = 0;
+	gup_flags = GHP_FOLL_LOOK_ONLY;
 	r.first_bad_offset = ~0ULL;
 	r.sample_bytes = GHP_SAMPLE_BYTES;
 
@@ -314,9 +334,11 @@ static long ghp_probe(unsigned long arg)
 		if (fatal_signal_pending(current))
 			return -EINTR;
 
-		/* No flags: an ordinary reference, never FOLL_LONGTERM, so this cannot
-		 * migrate anything -- which is the whole point of asking here. */
-		got = get_user_pages_fast(va, 1, 0, &page);
+		/* Look, never populate, never migrate (see the header comment). */
+		got = get_user_pages_fast(va, 1, gup_flags, &page);
+		if (got == -EINVAL)
+			pr_warn_once("pinprobe: kernel rejected FOLL_NOFAULT; every sample will "
+				     "read as absent\n");
 		if (got != 1) {
 			r.samples_absent++;
 			r.samples++;
