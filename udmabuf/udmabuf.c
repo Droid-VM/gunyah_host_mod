@@ -138,10 +138,10 @@ static const struct kernel_param_ops ukv_limit_ops = {
 	.get = param_get_int,
 };
 
-static int list_limit = 16384;
+static int list_limit = 65536; // pseudo unprotected vm use system ram, which is more frag, needs 16384 -> 65536
 module_param_cb(list_limit, &ukv_limit_ops, &list_limit, 0644);
 MODULE_PARM_DESC(list_limit,
-	"udmabuf_create_list->count limit. Pushed into the built-in driver too. Default 16384.");
+	"udmabuf_create_list->count limit. Pushed into the built-in driver too. Default 65536.");
 
 static int size_limit_mb = 4096;
 module_param_cb(size_limit_mb, &ukv_limit_ops, &size_limit_mb, 0644);
