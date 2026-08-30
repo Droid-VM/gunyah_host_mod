@@ -136,6 +136,17 @@ case "${1:-arm64}" in
     # gunyah_kvcalloc (6.1 only, downstream gh_*).
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
         gunyah_kvcalloc/GKI6.1 gunyah_kvcalloc_mod.c gunyah-kvcalloc-gki-6.1
+    # nproc_guard: no-reboot rescue for the per-uid RLIMIT_NPROC ucounts counter
+    # desyncing under DroidVM's root<->app real-uid switching (crosvm privilege
+    # drop + daemon), which otherwise wedges the app ("won't open until reboot").
+    # Loaded by the daemon with the app uid (insmod ... uid=<app uid>); a bare
+    # insmod is inert. KMI-agnostic source; builds for all three GKI KMIs.
+    build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
+        nproc_guard nproc_guard.c nproc-guard-gki-6.6
+    build_mod android16-6.12 ghcr.io/ylarod/ddk-min:android16-6.12 \
+        nproc_guard nproc_guard.c nproc-guard-gki-6.12
+    build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
+        nproc_guard nproc_guard.c nproc-guard-gki-6.1
     ;;
   *) echo "usage: $0 [arm64|descr]" >&2; exit 2 ;;
 esac
