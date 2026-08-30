@@ -133,6 +133,13 @@ EOF
 case "${1:-arm64}" in
   descr) build_descr; stage_match; exit 0 ;;
   arm64|aarch64|all)
+    # gunyah_host_share (6.6/6.12: upstream gunyah_* source; 6.1: downstream gh_* source).
+    build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
+        gunyah_host_share/GKI6.6 gunyah_share_mod.c gunyah-host-share-gki-6.6
+    build_mod android16-6.12 ghcr.io/ylarod/ddk-min:android16-6.12 \
+        gunyah_host_share/GKI6.6 gunyah_share_mod.c gunyah-host-share-gki-6.12
+    build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
+        gunyah_host_share/GKI6.1 gunyah_share_mod.c gunyah-host-share-gki-6.1
     # gunyah_kvcalloc (6.1 only, downstream gh_*).
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
         gunyah_kvcalloc/GKI6.1 gunyah_kvcalloc_mod.c gunyah-kvcalloc-gki-6.1

@@ -6,6 +6,29 @@ grouped by module type, then by GKI version. `build.sh` builds each into
 `usr/lib/modules/<kmi>/`, and the app's Kernel Module tab lists every `.ko`
 found in the KMI dir matching the running kernel.
 
+## gunyah_host_share — SHARE_BLOB / GuestAccept
+
+Runtime `/dev/gunyah_share` that lets crosvm SHARE a host-visible virtio-gpu
+blob to a running protected guest as an RM memparcel (the guest accepts it via
+its own HVC). No kernel patch: resolves the unexported RM helpers via kallsyms
+and reads the private structs by BTF-verified offset.
+
+Both copies are called `gunyah_share_mod.c`; the **directory** says which driver
+a copy is written against, because that — not the file name — is what differs:
+
+- **GKI6.6/** — for the **upstream** `gunyah_*` driver; built for **6.6** and
+  **6.12** from this one source (v5: liveness-GC auto-reclaim + bounded share
+  retry). 6.12 changed nothing it touches: `struct gunyah_vm` is identical
+  through `vm_status`, and every 6.12 addition lands after it. Two 6.12-only
+  behaviours are handled — the driver now stamps `parcel->label` from the
+  userspace region label, so ours carries a namespace bit to keep the two out of
+  one namespace, and the new `RESET_FAILED` VM state makes the reaper give up at
+  once instead of spending its whole retry budget on a VM that will never
+  release the guest's accepts.
+- **GKI6.1/** — for the **downstream** `gh_*` driver (6.1). This is the original
+  the 6.6 copy was adapted from; it vendors the private `struct gh_vm` layout
+  inline, so it needs no driver source.
+
 ## gunyah_kvcalloc — large-guest OOM fix (6.1)
 
 - **GKI6.1/** — reproduces the in-tree fix (commit `b6ff6203e4bc`) that makes
