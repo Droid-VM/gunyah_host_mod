@@ -47,7 +47,91 @@ build_mod() {
   echo "OK: ${OUT}/${tag}/${mod}.ko ($(stat -c%s "${OUT}/${tag}/${mod}.ko") bytes)"
 }
 
+# Stage descr/ -- the "why is this needed" page for each module -- into dist/descr/.
+# One self-contained HTML page per module carrying all three languages; the app picks
+# one at display time (and injects the live theme colours), so nothing here is
+# per-language or per-theme. The file name is the module-name PREFIX it applies to,
+# so udmabuf.html covers udmabuf_gki_6.6 and friends.
+#
+# No JSON, no archive: these land in usr/lib/modules/descr/ inside the app's prebuilt
+# tar.xz, which is already one compressed blob -- packing them again would only make
+# them unreadable to whoever has to edit them. They are rendered by a WebView, so a
+# page can use real CSS and inline SVG; open one straight in a browser to proofread
+# it (all languages show at once, on the fallback palette in style.css).
+build_descr() {
+  echo ">>> staging descr/"
+  rm -rf "${OUT}/descr"
+  mkdir -p "${OUT}/descr"
+  python3 - "${OUT}/descr" <<'EOF'
+import pathlib, re, shutil, sys
+src, dst = pathlib.Path("descr"), pathlib.Path(sys.argv[1])
+LANGS = ("en", "zh-CN", "zh-TW")
+pages = sorted(src.glob("*.html"))
+if not pages:
+    sys.exit("descr: no pages found")
+for page in pages:
+    text = page.read_text(encoding="utf-8")
+    # Every page must carry every language: the app's fallback to English is a
+    # safety net for old prebuilts, not a licence to ship a half-translated page.
+    missing = [l for l in LANGS if f'data-lang="{l}"' not in text]
+    if missing:
+        sys.exit(f"descr/{page.name}: missing languages: {missing}")
+    # The app swaps this link for the stylesheet inlined; without it the page would
+    # render unstyled on device while still looking right in a browser.
+    if not re.search(r'<link[^>]+style\.css[^>]*>', text):
+        sys.exit(f"descr/{page.name}: no <link ... style.css> for the app to replace")
+    # A figure sits inside its language's section, so its drawing is written once per
+    # language. Only the caption may differ -- catch a diagram edited in one copy and
+    # not the others, which no reader in the other two languages would ever report.
+    # Comments first: one that mentions a tag by name would otherwise open a "match".
+    svgs = re.findall(r'<svg\b.*?</svg>', re.sub(r'<!--.*?-->', '', text, flags=re.S), re.S)
+    if len(set(svgs)) > 1:
+        sys.exit(f"descr/{page.name}: its {len(svgs)} <svg> copies are not identical")
+    shutil.copy2(page, dst / page.name)
+print(f"OK: {len(pages)} page(s) -> {dst}")
+EOF
+}
+
+# Stage match.json -- which devices each module is FOR, and what its card is titled. The
+# KMI directory already says which kernel a .ko was built for; the "modules" rules say
+# which SoC it makes sense on, so a Gunyah module stays off a MediaTek phone (and a
+# MediaTek module, when one exists, stays off a Snapdragon). The "names" section maps the
+# same module-name prefixes to display names (top-level, NOT a rule field: older apps
+# fail a rule with a field they cannot judge, but ignore extra top-level keys). Rules and
+# names are keyed by module-name prefix, same convention as descr/. The app reads it from
+# usr/lib/modules/match.json; see the app's KernelModuleMatch for the schema.
+#
+# Every module built here must have a rule: an unmatched .ko is not listed at all, so a
+# missing rule silently deletes a module from the UI. Fail the build instead. Names are
+# optional (the app falls back to the name minus its _gki_X.Y tag), but a names key that
+# covers no built .ko is a typo silently showing users the fallback -- fail on that too.
+stage_match() {
+  echo ">>> staging match.json"
+  mkdir -p "${OUT}"
+  cp -f match.json "${OUT}/match.json"
+  python3 - "${OUT}" <<'EOF'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+data = json.loads((out / "match.json").read_text(encoding="utf-8"))
+rules = data["modules"]
+# Kbuild turns '-' into '_' in the loaded name; that is what the app matches on.
+kos = sorted({ko.stem.replace("-", "_") for ko in out.glob("*/*.ko")})
+missing = [n for n in kos if not any(n.startswith(k) for k in rules)]
+if missing:
+    sys.exit(f"match.json: no rule covers {missing}")
+names = data.get("names", {})
+bad = [k for k, v in names.items() if not isinstance(v, str) or not v.strip()]
+if bad:
+    sys.exit(f"match.json: names must be non-empty strings: {sorted(bad)}")
+stray = [k for k in names if not any(n.startswith(k) for n in kos)]
+if stray:
+    sys.exit(f"match.json: names for no built module (typo?): {sorted(stray)}")
+print(f"OK: {len(rules)} rule(s), {len(names)} name(s) -> {out}/match.json")
+EOF
+}
+
 case "${1:-arm64}" in
+  descr) build_descr; stage_match; exit 0 ;;
   arm64|aarch64|all)
     # gunyah_kvcalloc (6.1 only, downstream gh_*).
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
@@ -55,4 +139,6 @@ case "${1:-arm64}" in
     ;;
   *) echo "usage: $0 [arm64|descr]" >&2; exit 2 ;;
 esac
+build_descr
+stage_match
 echo "Done. Modules in ${OUT}/"

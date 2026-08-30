@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "modules": {
+    "gunyah_host_share": { "soc_vendor": ["qualcomm"] },
+    "gunyah_kvcalloc": { "soc_vendor": ["qualcomm"] },
+    "gh_unmovable": { "soc_vendor": ["qualcomm"] },
+    "udmabuf": { "comment": "generic dma-buf provider/repair, nothing Gunyah about it: any SoC" }
+  },
+  "names": {
+    "gunyah_host_share": "Gunyah Host Share",
+    "gunyah_kvcalloc": "Gunyah kvcalloc Fix",
+    "gh_unmovable": "GH Unmovable",
+    "udmabuf": "Udmabuf Fix"
+  }
+}
