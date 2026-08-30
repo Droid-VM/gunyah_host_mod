@@ -151,6 +151,20 @@ case "${1:-arm64}" in
         gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.12
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
         gh_unmovable/GKI6.6 gh_unmovable.c gh-unmovable-gki-6.1
+    # udmabuf: registers /dev/udmabuf where the kernel has none (CONFIG_UDMABUF
+    # unset, e.g. QCOM 6.1 kernel_platform), kprobe-repairs the built-in where it
+    # still kmalloc_arrays its page-pointer array (all GKI 6.6 - order-6 alloc
+    # fails on a fragmented phone), and where the kernel is already fixed still
+    # raises its 64 MiB size cap, which no VkDeviceMemory blob fits under.
+    # Safe to autostart on any device. One portable source for all three KMIs;
+    # the per-KMI module name keeps /sys/module from clashing with a built-in
+    # "udmabuf".
+    build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
+        udmabuf udmabuf.c udmabuf-gki-6.6
+    build_mod android16-6.12 ghcr.io/ylarod/ddk-min:android16-6.12 \
+        udmabuf udmabuf.c udmabuf-gki-6.12
+    build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
+        udmabuf udmabuf.c udmabuf-gki-6.1
     # nproc_guard: no-reboot rescue for the per-uid RLIMIT_NPROC ucounts counter
     # desyncing under DroidVM's root<->app real-uid switching (crosvm privilege
     # drop + daemon), which otherwise wedges the app ("won't open until reboot").
