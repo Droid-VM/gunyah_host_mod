@@ -49,6 +49,9 @@ build_mod() {
 
 case "${1:-arm64}" in
   arm64|aarch64|all)
+    # gunyah_kvcalloc (6.1 only, downstream gh_*).
+    build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
+        gunyah_kvcalloc/GKI6.1 gunyah_kvcalloc_mod.c gunyah-kvcalloc-gki-6.1
     ;;
   *) echo "usage: $0 [arm64|descr]" >&2; exit 2 ;;
 esac
