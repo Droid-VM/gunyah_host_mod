@@ -52,6 +52,37 @@ struct ghsm_share_blob {
 #define GHSM_SHARE_BLOB _IOWR(GHSM_IOCTL_TYPE, 0x14, struct ghsm_share_blob)
 
 /**
+ * struct ghsm_share_dmabuf - runtime-SHARE a DMA-BUF to a running guest.
+ * @vm_fd: the gunyah VM fd (from GH_CREATE_VM); validated by the module.
+ * @dmabuf_fd: DMA-BUF fd in the calling process.
+ * @label: parcel label, unique within this VM.
+ * @flags: GH_MEM_ALLOW_READ / _WRITE / _EXEC (see uapi/linux/gunyah.h).
+ * @mem_handle: OUT - resource-manager memparcel handle for the guest to accept.
+ * @reserved: must be zero.
+ * @guest_phys_addr: GPA the guest intends to accept it at (informational).
+ * @memory_size: page-aligned byte count to share.
+ * @dmabuf_offset: page-aligned offset into the DMA-BUF.
+ *
+ * Unlike GHSM_SHARE_BLOB, this does not try to GUP the DMA-BUF's userspace
+ * mmap.  Many device exporters use VM_PFNMAP/VM_MIXEDMAP VMAs that GUP must
+ * reject.  The module holds an attachment and builds the memparcel from its
+ * sg-table until GHSM_UNSHARE_BLOB has reclaimed the parcel.
+ */
+struct ghsm_share_dmabuf {
+	__s32 vm_fd;
+	__s32 dmabuf_fd;
+	__u32 label;
+	__u32 flags;
+	__u32 mem_handle;
+	__u32 reserved;
+	__u64 guest_phys_addr;
+	__u64 memory_size;
+	__u64 dmabuf_offset;
+};
+
+#define GHSM_SHARE_DMABUF _IOWR(GHSM_IOCTL_TYPE, 0x16, struct ghsm_share_dmabuf)
+
+/**
  * struct ghsm_unshare_blob - reclaim a blob previously shared with GHSM_SHARE_BLOB.
  * @vm_fd: the gunyah VM fd; validated by the module.
  * @label: parcel label to reclaim (the guest has already released its acceptance).

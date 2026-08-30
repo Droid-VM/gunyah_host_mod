@@ -46,6 +46,9 @@
 #include <linux/workqueue.h>
 #include <linux/delay.h>
 #include <linux/vmalloc.h>	/* vmalloc_user/vfree: 6.12 dropped the transitive include */
+#include <linux/dma-buf.h>
+#include <linux/dma-mapping.h>
+#include <linux/scatterlist.h>
 
 /* ---- UAPI (inlined; must match crosvm gunyah_sys bindings + l233 uapi) ---- */
 #define GHSM_IOCTL_TYPE 0x47 /* 'G' */
@@ -59,6 +62,18 @@ struct ghsm_share_blob {
 	__u64 userspace_addr;
 };
 #define GHSM_SHARE_BLOB _IOWR(GHSM_IOCTL_TYPE, 0x14, struct ghsm_share_blob)
+struct ghsm_share_dmabuf {
+	__s32 vm_fd;
+	__s32 dmabuf_fd;
+	__u32 label;
+	__u32 flags;
+	__u32 mem_handle;
+	__u32 reserved;
+	__u64 guest_phys_addr;
+	__u64 memory_size;
+	__u64 dmabuf_offset;
+};
+#define GHSM_SHARE_DMABUF _IOWR(GHSM_IOCTL_TYPE, 0x16, struct ghsm_share_dmabuf)
 struct ghsm_unshare_blob {
 	__s32 vm_fd;
 	__u32 label;
@@ -153,6 +168,9 @@ static void (*p_rm_put)(struct gunyah_rm *rm);
  * VMs would never tear down inside ghsm_exit's retry loop. */
 static void (*p_fput_sync)(struct file *f);
 
+/* Registered in ghsm_init(); also used as the DMA-BUF importer device. */
+static struct miscdevice ghsm_dev;
+
 static unsigned long lookup_name(const char *name)
 {
 	static unsigned long (*kln)(const char *);
@@ -189,6 +207,11 @@ struct ghsm_map {
 					 * refused, or VM found ownerless) */
 	struct page **pages;
 	unsigned long npages;
+	/* DMA-BUF source.  map_attachment pins/stabilizes the exporter backing for
+	 * the whole memparcel lifetime, so this replaces pages[]/GUP when set. */
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attachment;
+	struct sg_table *sgt;
 	struct gunyah_rm_mem_parcel parcel;
 };
 static LIST_HEAD(ghsm_maps);
@@ -208,7 +231,14 @@ static struct ghsm_map *find_map(void *ghvm, u32 label)
  * never unpinned (leak-over-corruption). */
 static void ghsm_map_free(struct ghsm_map *m)
 {
-	unpin_user_pages(m->pages, m->npages);
+	if (m->dmabuf) {
+		dma_buf_unmap_attachment(m->attachment, m->sgt,
+					 DMA_BIDIRECTIONAL);
+		dma_buf_detach(m->dmabuf, m->attachment);
+		dma_buf_put(m->dmabuf);
+	} else {
+		unpin_user_pages(m->pages, m->npages);
+	}
 	if (m->vm_file)
 		fput(m->vm_file);
 	if (p_rm_put)
@@ -371,6 +401,42 @@ static u8 flags_to_perms(u32 flags)
 	return p;
 }
 
+/* Submit a fully-built map to the RM and publish it in the live table.  The
+ * caller still owns @m on failure and must unwind its chosen backing type. */
+static int ghsm_submit_share(struct ghsm_map *m, u16 guest_vmid,
+			     u32 *out_handle)
+{
+	int ret, tries;
+
+	/* RM occasionally rejects a share transiently while a just-reclaimed
+	 * parcel is still settling.  Keep the existing bounded retry behavior for
+	 * both GUP and DMA-BUF sources. */
+	for (tries = 0; tries < 8; tries++) {
+		ret = p_rm_mem_share(m->rm, &m->parcel);
+		if (!ret)
+			break;
+		usleep_range(500, 1500);
+	}
+	if (ret) {
+		pr_err("rm_mem_share label=%u ret=%d (after %d tries)\n",
+		       m->label, ret, tries);
+		return ret;
+	}
+	if (tries)
+		pr_info("share label=%u succeeded after %d retries\n",
+			m->label, tries);
+
+	*out_handle = m->parcel.mem_handle;
+	mutex_lock(&ghsm_lock);
+	list_add(&m->node, &ghsm_maps);
+	schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
+	mutex_unlock(&ghsm_lock);
+	pr_info("SHARE label=%u gpa_pages=%lu entries=%zu source=%s guest_vmid=%u handle=0x%x\n",
+		m->label, m->npages, m->parcel.n_mem_entries,
+		m->dmabuf ? "dmabuf" : "gup", guest_vmid, *out_handle);
+	return 0;
+}
+
 /* Core: pin the userspace buffer, build a SHARE parcel (guest keeps host access),
  * hand it to the RM, return the handle. Mirrors gunyah_gup_share_parcel. */
 static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
@@ -483,44 +549,10 @@ static int ghsm_share(void *ghvm, struct file *vmf, struct gunyah_rm *rm,
 	}
 	m->parcel.mem_entries[entry].size = cpu_to_le64(run_size);
 
-	/* RM occasionally rejects a share (ret<0, seen as EPERM guest-side) under
-	 * churn — most likely a transient: a just-reclaimed parcel's teardown (or
-	 * the guest's stage-2 unmap of a recycled BAR offset) has not fully
-	 * settled in the RM/hyp when the new share for the reused resources
-	 * arrives.  A single such failure kills a whole guest client (a critical
-	 * BO's map fails -> zink DEVICE_LOST -> gnome-shell crash).  Retry with a
-	 * short backoff to ride out the settle window; if it never clears it is a
-	 * hard rejection and we fail as before.  (Arena mode eliminates this by
-	 * not doing per-BO shares at all.) */
-	{
-		int tries;
-		for (tries = 0; tries < 8; tries++) {
-			ret = p_rm_mem_share(rm, &m->parcel);
-			if (!ret)
-				break;
-			usleep_range(500, 1500);
-		}
-		if (ret) {
-			pr_err("rm_mem_share label=%u ret=%d (after %d tries)\n",
-			       label, ret, tries);
-			goto free_entries;
-		}
-		if (tries)
-			pr_info("share label=%u succeeded after %d retries\n",
-				label, tries);
-	}
+	ret = ghsm_submit_share(m, guest_vmid, out_handle);
+	if (!ret)
+		return 0;
 
-	*out_handle = m->parcel.mem_handle;
-	mutex_lock(&ghsm_lock);
-	list_add(&m->node, &ghsm_maps);
-	/* arm the liveness GC (no-op if already pending) */
-	schedule_delayed_work(&ghsm_reaper_work, GHSM_REAP_INTERVAL);
-	mutex_unlock(&ghsm_lock);
-	pr_info("SHARE label=%u gpa_pages=%lu entries=%lu guest_vmid=%u handle=0x%x\n",
-		label, npages, n_entries, guest_vmid, *out_handle);
-	return 0;
-
-free_entries:
 	kvfree(m->parcel.mem_entries);
 free_acl:
 	kfree(m->parcel.acl_entries);
@@ -533,6 +565,172 @@ unpin:
 	unpin_user_pages(pages, pinned > 0 ? pinned : 0);
 free_pages:
 	kvfree(pages);
+	return ret;
+}
+
+/* Share an existing DMA-BUF without going through its userspace VMA.  The
+ * attachment is the lifetime pin; the RM receives physical runs sliced from
+ * the exporter's sg-table. */
+static int ghsm_share_dmabuf(void *ghvm, struct file *vmf,
+			     struct gunyah_rm *rm, u32 label, u32 flags,
+			     int dmabuf_fd, u64 offset, u64 size,
+			     u32 *out_handle)
+{
+	struct dma_buf_attachment *attachment;
+	struct gunyah_rm_mem_entry *entries;
+	struct dma_buf *dmabuf;
+	struct ghsm_map *m;
+	struct scatterlist *sg;
+	u64 skip, remain;
+	u16 guest_vmid, host_vmid;
+	unsigned int i;
+	size_t n_entries = 0;
+	int ret;
+
+	if (!IS_ALIGNED(offset, PAGE_SIZE) || !IS_ALIGNED(size, PAGE_SIZE) || !size)
+		return -EINVAL;
+
+	mutex_lock(&ghsm_lock);
+	if (find_map(ghvm, label)) {
+		mutex_unlock(&ghsm_lock);
+		return -EBUSY;
+	}
+	mutex_unlock(&ghsm_lock);
+
+	dmabuf = dma_buf_get(dmabuf_fd);
+	if (IS_ERR(dmabuf)) {
+		/* Tell userspace that an ordinary fd should use the VA/GUP ioctl. */
+		ret = PTR_ERR(dmabuf);
+		return ret == -EINVAL ? -ENOTTY : ret;
+	}
+	if (offset > dmabuf->size || size > dmabuf->size - offset) {
+		ret = -EINVAL;
+		goto put_dmabuf;
+	}
+
+	attachment = dma_buf_attach(dmabuf, ghsm_dev.this_device);
+	if (IS_ERR(attachment)) {
+		ret = PTR_ERR(attachment);
+		pr_err("SHARE_DMABUF label=%u: attach failed: %d\n", label, ret);
+		goto put_dmabuf;
+	}
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m) {
+		ret = -ENOMEM;
+		goto detach;
+	}
+	m->sgt = dma_buf_map_attachment(attachment, DMA_BIDIRECTIONAL);
+	if (IS_ERR(m->sgt)) {
+		ret = PTR_ERR(m->sgt);
+		pr_err("SHARE_DMABUF label=%u: map_attachment failed: %d\n",
+		       label, ret);
+		m->sgt = NULL;
+		goto free_m_only;
+	}
+	if (!m->sgt->orig_nents) {
+		ret = -EINVAL;
+		goto unmap;
+	}
+
+	/* At most one output run per source SG entry; adjacent physical runs are
+	 * folded below. */
+	entries = kvcalloc(m->sgt->orig_nents, sizeof(*entries),
+			   GFP_KERNEL_ACCOUNT);
+	if (!entries) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
+
+	skip = offset;
+	remain = size;
+	for_each_sgtable_sg(m->sgt, sg, i) {
+		u64 phys, take;
+
+		if (!remain)
+			break;
+		if (skip >= sg->length) {
+			skip -= sg->length;
+			continue;
+		}
+		phys = sg_phys(sg) + skip;
+		take = min_t(u64, (u64)sg->length - skip, remain);
+		if (!IS_ALIGNED(phys, PAGE_SIZE) || !IS_ALIGNED(take, PAGE_SIZE)) {
+			pr_err("SHARE_DMABUF label=%u: unaligned SG phys=%#llx len=%#llx\n",
+			       label, phys, take);
+			ret = -EINVAL;
+			goto free_entries_dmabuf;
+		}
+		if (n_entries &&
+		    le64_to_cpu(entries[n_entries - 1].phys_addr) +
+		    le64_to_cpu(entries[n_entries - 1].size) == phys) {
+			entries[n_entries - 1].size = cpu_to_le64(
+				le64_to_cpu(entries[n_entries - 1].size) + take);
+		} else {
+			entries[n_entries].phys_addr = cpu_to_le64(phys);
+			entries[n_entries].size = cpu_to_le64(take);
+			n_entries++;
+		}
+		remain -= take;
+		skip = 0;
+	}
+	if (remain) {
+		pr_err("SHARE_DMABUF label=%u: sg-table short by %#llx bytes\n",
+		       label, remain);
+		ret = -EINVAL;
+		goto free_entries_dmabuf;
+	}
+
+	m->ghvm = ghvm;
+	m->label = label;
+	m->npages = size >> PAGE_SHIFT;
+	m->vm_file = get_file(vmf);
+	m->rm = rm;
+	m->dmabuf = dmabuf;
+	m->attachment = attachment;
+	if (p_rm_get)
+		p_rm_get(rm);
+
+	guest_vmid = ghvm_vmid(ghvm);
+	ret = gunyah_rm_get_vmid(rm, &host_vmid);
+	if (ret)
+		goto free_tracked;
+	m->parcel.mem_type = GUNYAH_RM_MEM_TYPE_NORMAL;
+	m->parcel.label = label | GHSM_LABEL_NS;
+	m->parcel.mem_handle = GUNYAH_MEM_HANDLE_INVAL;
+	m->parcel.n_acl_entries = 2;
+	m->parcel.acl_entries = kcalloc(2, sizeof(*m->parcel.acl_entries), GFP_KERNEL);
+	if (!m->parcel.acl_entries) {
+		ret = -ENOMEM;
+		goto free_tracked;
+	}
+	m->parcel.acl_entries[0].vmid = cpu_to_le16(guest_vmid);
+	m->parcel.acl_entries[0].perms = flags_to_perms(flags);
+	m->parcel.acl_entries[1].vmid = cpu_to_le16(host_vmid);
+	m->parcel.acl_entries[1].perms =
+		GUNYAH_RM_ACL_R | GUNYAH_RM_ACL_W | GUNYAH_RM_ACL_X;
+	m->parcel.n_mem_entries = n_entries;
+	m->parcel.mem_entries = entries;
+
+	ret = ghsm_submit_share(m, guest_vmid, out_handle);
+	if (!ret)
+		return 0;
+
+	kfree(m->parcel.acl_entries);
+free_tracked:
+	if (p_rm_put)
+		p_rm_put(m->rm);
+	fput(m->vm_file);
+	m->vm_file = NULL;
+free_entries_dmabuf:
+	kvfree(entries);
+unmap:
+	dma_buf_unmap_attachment(attachment, m->sgt, DMA_BIDIRECTIONAL);
+free_m_only:
+	kfree(m);
+detach:
+	dma_buf_detach(dmabuf, attachment);
+put_dmabuf:
+	dma_buf_put(dmabuf);
 	return ret;
 }
 
@@ -590,6 +788,28 @@ static long ghsm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 b.userspace_addr, b.memory_size, &handle);
 		fput(vmf);
 		if (ret) return ret;
+		b.mem_handle = handle;
+		if (copy_to_user((void __user *)arg, &b, sizeof(b)))
+			return -EFAULT;
+		return 0;
+	}
+	case GHSM_SHARE_DMABUF: {
+		struct ghsm_share_dmabuf b;
+		u32 handle = 0;
+		if (copy_from_user(&b, (void __user *)arg, sizeof(b)))
+			return -EFAULT;
+		if (b.reserved)
+			return -EINVAL;
+		ghvm = ghsm_get_ghvm(b.vm_fd, &vmf);
+		if (!ghvm)
+			return -EINVAL;
+		rm = ghvm_rm(ghvm);
+		ret = ghsm_share_dmabuf(ghvm, vmf, rm, b.label, b.flags,
+					b.dmabuf_fd, b.dmabuf_offset,
+					b.memory_size, &handle);
+		fput(vmf);
+		if (ret)
+			return ret;
 		b.mem_handle = handle;
 		if (copy_to_user((void __user *)arg, &b, sizeof(b)))
 			return -EFAULT;
@@ -741,8 +961,13 @@ static int __init ghsm_init(void)
 	p_fput_sync = (void *)lookup_name("__fput_sync");
 	ret = misc_register(&ghsm_dev);
 	if (ret) return ret;
+	ret = dma_coerce_mask_and_coherent(ghsm_dev.this_device, DMA_BIT_MASK(64));
+	if (ret) {
+		misc_deregister(&ghsm_dev);
+		return ret;
+	}
 	ghsm_dbg = debugfs_create_file("gh_share_probe", 0200, NULL, NULL, &gsp_fops);
-	pr_info("loaded v5/liveness-gc+share-retry (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
+	pr_info("loaded v6/dmabuf+gup (share=%px reclaim=%px rm_ref=%d vmid_off=%d rm_off=%d)\n",
 		p_rm_mem_share, p_rm_mem_reclaim, !!p_rm_get, vmid_off, rm_off);
 	return 0;
 }
@@ -801,4 +1026,5 @@ static void __exit ghsm_exit(void)
 module_init(ghsm_init);
 module_exit(ghsm_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Standalone runtime SHARE_BLOB for upstream gunyah 6.6 (GuestAccept), v3: per-fd auto-reclaim on crosvm death");
+MODULE_IMPORT_NS(DMA_BUF);
+MODULE_DESCRIPTION("Standalone runtime SHARE_BLOB/DMABUF for upstream gunyah 6.6 (GuestAccept)");
