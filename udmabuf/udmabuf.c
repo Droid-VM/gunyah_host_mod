@@ -323,7 +323,8 @@ static void ukv_vunmap(struct dma_buf *buf, struct iosys_map *map)
 #endif
 
 static struct sg_table *ukv_get_sg_table(struct device *dev, struct dma_buf *buf,
-					 enum dma_data_direction direction)
+					 enum dma_data_direction direction,
+					 unsigned long attrs)
 {
 	struct udmabuf_kv *ubuf = buf->priv;
 	struct sg_table *sg;
@@ -337,7 +338,7 @@ static struct sg_table *ukv_get_sg_table(struct device *dev, struct dma_buf *buf
 					GFP_KERNEL);
 	if (ret < 0)
 		goto err;
-	ret = dma_map_sgtable(dev, sg, direction, 0);
+	ret = dma_map_sgtable(dev, sg, direction, attrs);
 	if (ret < 0)
 		goto err;
 	return sg;
@@ -349,23 +350,36 @@ err:
 }
 
 static void ukv_put_sg_table(struct device *dev, struct sg_table *sg,
-			     enum dma_data_direction direction)
+			     enum dma_data_direction direction,
+			     unsigned long attrs)
 {
-	dma_unmap_sgtable(dev, sg, direction, 0);
+	dma_unmap_sgtable(dev, sg, direction, attrs);
 	sg_free_table(sg);
 	kfree(sg);
 }
 
+/*
+ * An attachment is mapped with the attributes its importer asked for, as the
+ * dma-buf heaps map theirs. KGSL asks DMA_ATTR_SKIP_CPU_SYNC of every
+ * KGSL_MEMFLAGS_IOCOHERENT import (the GPU snoops the CPU caches) and attaches
+ * with its kgsl-3d0 device, which the device tree does not mark dma-coherent:
+ * mapped with no attributes, each unmap ran arch_sync_dma_for_cpu over the
+ * buffer -- dcache_inval_poc, an invalidate that drops dirty lines unwritten.
+ * The pages are a guest's RAM, which the guest goes on using after the host
+ * lets an import go, and its vCPUs share these caches: whatever it had written
+ * there and not yet seen written back was lost (an iPadOS guest's IOSurfaces
+ * read back as zero rows after their GPU imports were released).
+ */
 static struct sg_table *ukv_map(struct dma_buf_attachment *at,
 				enum dma_data_direction direction)
 {
-	return ukv_get_sg_table(at->dev, at->dmabuf, direction);
+	return ukv_get_sg_table(at->dev, at->dmabuf, direction, at->dma_map_attrs);
 }
 
 static void ukv_unmap(struct dma_buf_attachment *at, struct sg_table *sg,
 		      enum dma_data_direction direction)
 {
-	return ukv_put_sg_table(at->dev, sg, direction);
+	return ukv_put_sg_table(at->dev, sg, direction, at->dma_map_attrs);
 }
 
 static void ukv_release(struct dma_buf *buf)
@@ -375,7 +389,7 @@ static void ukv_release(struct dma_buf *buf)
 	pgoff_t pg;
 
 	if (ubuf->sg)
-		ukv_put_sg_table(dev, ubuf->sg, DMA_BIDIRECTIONAL);
+		ukv_put_sg_table(dev, ubuf->sg, DMA_BIDIRECTIONAL, 0);
 
 	for (pg = 0; pg < ubuf->pagecount; pg++)
 		put_page(ubuf->pages[pg]);
@@ -390,7 +404,7 @@ static int ukv_begin_cpu(struct dma_buf *buf, enum dma_data_direction direction)
 	int ret = 0;
 
 	if (!ubuf->sg) {
-		ubuf->sg = ukv_get_sg_table(dev, buf, direction);
+		ubuf->sg = ukv_get_sg_table(dev, buf, direction, 0);
 		if (IS_ERR(ubuf->sg)) {
 			ret = PTR_ERR(ubuf->sg);
 			ubuf->sg = NULL;
