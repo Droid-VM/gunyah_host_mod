@@ -322,6 +322,37 @@ static void ukv_vunmap(struct dma_buf *buf, struct iosys_map *map)
 }
 #endif
 
+/*
+ * The pages are a running guest's RAM, and its vCPUs share the host's caches: an invalidate
+ * (dcache_inval_poc -- a sync for the CPU, a map or unmap from the device's side, or a map for
+ * DMA_FROM_DEVICE) drops the lines the guest has written and not yet seen written back, wherever
+ * the guest now uses those pages. never_invalidate makes every maintenance here a clean: a device
+ * that reads the pages still sees what the CPUs wrote, and no CPU (host or guest, coherent with each
+ * other) can need an invalidate to see another's writes. The counters say which of those paths run:
+ * maps and unmaps without DMA_ATTR_SKIP_CPU_SYNC (by direction: bidirectional, to, from the device),
+ * CPU accesses begun and ended, and releases that unmapped the CPU access's table.
+ */
+static bool never_invalidate;
+module_param(never_invalidate, bool, 0644);
+MODULE_PARM_DESC(never_invalidate, "clean instead of invalidating guest pages (1) or sync as the DMA API does (0)");
+static unsigned long stat_map_sync[3], stat_unmap_sync[3], stat_cpu_begin, stat_cpu_end, stat_release_sg;
+static int stat_count = 3;
+module_param_array_named(map_sync, stat_map_sync, ulong, &stat_count, 0444);
+module_param_array_named(unmap_sync, stat_unmap_sync, ulong, &stat_count, 0444);
+module_param_named(cpu_begin, stat_cpu_begin, ulong, 0444);
+module_param_named(cpu_end, stat_cpu_end, ulong, 0444);
+module_param_named(release_sg, stat_release_sg, ulong, 0444);
+
+static void ukv_count(unsigned long *stat, struct device *dev, enum dma_data_direction direction,
+		      unsigned long attrs, const char *what)
+{
+	if ((attrs & DMA_ATTR_SKIP_CPU_SYNC) || direction > DMA_FROM_DEVICE)
+		return;
+	stat[direction]++;
+	pr_info_ratelimited("udmabuf_kv: %s with cache maintenance by %s, direction %d\n", what,
+			    dev ? dev_name(dev) : "?", direction);
+}
+
 static struct sg_table *ukv_get_sg_table(struct device *dev, struct dma_buf *buf,
 					 enum dma_data_direction direction,
 					 unsigned long attrs)
@@ -338,6 +369,15 @@ static struct sg_table *ukv_get_sg_table(struct device *dev, struct dma_buf *buf
 					GFP_KERNEL);
 	if (ret < 0)
 		goto err;
+	ukv_count(stat_map_sync, dev, direction, attrs, "map");
+	if (never_invalidate && !(attrs & DMA_ATTR_SKIP_CPU_SYNC)) {
+		/* Mapped without maintenance, then cleaned: a device reading them sees the CPUs' writes. */
+		ret = dma_map_sgtable(dev, sg, direction, attrs | DMA_ATTR_SKIP_CPU_SYNC);
+		if (ret < 0)
+			goto err;
+		dma_sync_sgtable_for_device(dev, sg, DMA_TO_DEVICE);
+		return sg;
+	}
 	ret = dma_map_sgtable(dev, sg, direction, attrs);
 	if (ret < 0)
 		goto err;
@@ -353,7 +393,8 @@ static void ukv_put_sg_table(struct device *dev, struct sg_table *sg,
 			     enum dma_data_direction direction,
 			     unsigned long attrs)
 {
-	dma_unmap_sgtable(dev, sg, direction, attrs);
+	ukv_count(stat_unmap_sync, dev, direction, attrs, "unmap");
+	dma_unmap_sgtable(dev, sg, direction, never_invalidate ? attrs | DMA_ATTR_SKIP_CPU_SYNC : attrs);
 	sg_free_table(sg);
 	kfree(sg);
 }
@@ -388,8 +429,10 @@ static void ukv_release(struct dma_buf *buf)
 	struct device *dev = ubuf->device->this_device;
 	pgoff_t pg;
 
-	if (ubuf->sg)
+	if (ubuf->sg) {
+		stat_release_sg++;
 		ukv_put_sg_table(dev, ubuf->sg, DMA_BIDIRECTIONAL, 0);
+	}
 
 	for (pg = 0; pg < ubuf->pagecount; pg++)
 		put_page(ubuf->pages[pg]);
@@ -403,13 +446,15 @@ static int ukv_begin_cpu(struct dma_buf *buf, enum dma_data_direction direction)
 	struct device *dev = ubuf->device->this_device;
 	int ret = 0;
 
+	stat_cpu_begin++;
 	if (!ubuf->sg) {
 		ubuf->sg = ukv_get_sg_table(dev, buf, direction, 0);
 		if (IS_ERR(ubuf->sg)) {
 			ret = PTR_ERR(ubuf->sg);
 			ubuf->sg = NULL;
 		}
-	} else {
+	} else if (!never_invalidate) {
+		/* The CPUs are coherent with each other: only a device's writes need this, and it drops the guest's. */
 		dma_sync_sgtable_for_cpu(dev, ubuf->sg, direction);
 	}
 
@@ -424,7 +469,8 @@ static int ukv_end_cpu(struct dma_buf *buf, enum dma_data_direction direction)
 	if (!ubuf->sg)
 		return -EINVAL;
 
-	dma_sync_sgtable_for_device(dev, ubuf->sg, direction);
+	stat_cpu_end++;
+	dma_sync_sgtable_for_device(dev, ubuf->sg, never_invalidate ? DMA_TO_DEVICE : direction);
 	return 0;
 }
 
