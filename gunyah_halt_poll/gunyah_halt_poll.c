@@ -19,7 +19,8 @@
  * The built-in driver is not modified. A kprobe on wait_for_completion_interruptible() redirects
  * the calls made from gunyah_vcpu_ioctl() (gunyah_vcpu_run() is inlined into it; it is checked
  * too, in case a kernel keeps it out of line) to gunyah_halt_poll_wait(), which polls and then
- * makes the real call. Every other caller in the kernel goes through untouched.
+ * makes the real call. Every other caller in the kernel goes through untouched. As in KVM, a
+ * poll ends as soon as another task is runnable on the CPU.
  *
  * Tunables (/sys/module/gunyah_halt_poll_gki_6.6/parameters/):
  *   halt_poll_ns         upper bound of a poll, ns (0 = off; KVM's default is 200000)
@@ -138,6 +139,13 @@ static void ghp_adapt(unsigned int *poll, u64 halted_ns)
 /* ------------------------------------------------------------------------- */
 
 /*
+ * single_task_running() is not in the GKI 6.6 export list (vmlinux has it, its __ksymtab entry is
+ * trimmed), so it is resolved by name like the callers below. The prototype must stay exact: this
+ * is an indirect call under CONFIG_CFI_CLANG. Without it a poll ends on need_resched() alone.
+ */
+static bool (*ghp_single_task_running)(void);
+
+/*
  * Entered from the kprobe with x0 still holding wait_for_completion_interruptible()'s argument
  * and the return address still pointing into gunyah_vcpu_ioctl(), so this runs as if the driver
  * had called it. It returns what the real wait would have: 0 once the completion is done (taken
@@ -168,7 +176,12 @@ static int gunyah_halt_poll_wait(struct completion *x)
 				goto out;
 			}
 			now = ktime_get_mono_fast_ns();
-			if (now >= end || need_resched() || signal_pending(current))
+			/* As KVM's kvm_vcpu_can_poll(): stop as soon as anything else wants this
+			 * CPU -- with every vCPU of a busy guest polling, the VMM's own device
+			 * threads would otherwise wait out the polls for a core to complete on. */
+			if (now >= end || need_resched() ||
+			    (ghp_single_task_running && !ghp_single_task_running()) ||
+			    signal_pending(current))
 				break;
 			cpu_relax();
 		}
@@ -245,6 +258,9 @@ static int ghp_resolve(void)
 	unregister_kprobe(&kp);
 
 	ghp_lookup_size_offset = (void *)ghp_lookup_name("kallsyms_lookup_size_offset");
+	ghp_single_task_running = (void *)ghp_lookup_name("single_task_running");
+	if (!ghp_single_task_running)
+		pr_warn("single_task_running not found: polls stop on need_resched() only\n");
 	if (!ghp_lookup_size_offset)
 		return -ENOENT;
 
