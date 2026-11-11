@@ -5,6 +5,7 @@
 #   gunyah_host_share  SHARE_BLOB / GuestAccept   -> 6.6, 6.12 (upstream gunyah_*), 6.1 (gh_*)
 #   gunyah_kvcalloc    large-guest >2GB OOM fix   -> 6.1                            (downstream gh_*)
 #   udmabuf            provide/repair udmabuf     -> 6.1, 6.6, 6.12 (one portable source)
+#   gunyah_halt_poll   halt polling for vCPUs     -> 6.6                            (built-in gunyah_vcpu)
 #
 # Kbuild/modpost turns the '-' in the module name into '_' and keeps the '.', so the
 # loaded name matches what the app's Kernel Module tab derives from the .ko filename.
@@ -176,6 +177,13 @@ case "${1:-arm64}" in
         nproc_guard nproc_guard.c nproc-guard-gki-6.12
     build_mod android14-6.1  ghcr.io/ylarod/ddk-min:android14-6.1  \
         nproc_guard nproc_guard.c nproc-guard-gki-6.1
+    # gunyah_halt_poll: KVM-style halt polling for the GKI 6.6 built-in gunyah_vcpu driver,
+    # which sleeps a vCPU thread the moment its guest idles; a kprobe redirects that wait
+    # to a short adaptive spin first, so a wakeup that comes soon (an I/O completion MSI)
+    # skips the host's sleep/IRQ/scheduler round trip. Only 6.6 so far: 6.1 runs the
+    # downstream gh_vcpu driver, 6.12 is untested.
+    build_mod android15-6.6  ghcr.io/ylarod/ddk-min:android15-6.6  \
+        gunyah_halt_poll gunyah_halt_poll.c gunyah-halt-poll-gki-6.6
     ;;
   *) echo "usage: $0 [arm64|descr]" >&2; exit 2 ;;
 esac

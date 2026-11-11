@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<title>gunyah_halt_poll</title>
+</head>
+<body>
+
+<div class="i18n" data-lang="en">
+    <section>
+        <h2>Why it's needed</h2>
+        <p>When a guest CPU has nothing to do it idles, and the kernel's Gunyah driver puts the VM's CPU thread to sleep straight away. The next interrupt for that CPU — a disk or network completion, say — has to wake it the long way: through the hypervisor, an interrupt on the phone's first core, and the scheduler, before the guest runs again. A Windows guest idles thousands of times a second, and every I/O it waits on pays that trip.</p>
+    </section>
+    <section>
+        <h2>What it does</h2>
+        <p>Before the thread sleeps, it waits a moment (at most 200 µs) for the wakeup to arrive, the way KVM's <em>halt polling</em> does on PCs. A completion that comes within that window goes straight back to the guest. The window adapts per guest CPU: it grows while wakeups arrive soon after an idle and shrinks to nothing when they don't, so an idle VM costs next to no extra power.</p>
+        <p>The built-in driver is not changed; the module only steps in on the vCPU's wait. Turn it off at run time with <code>su -c 'echo 0 &gt; /sys/module/gunyah_halt_poll_gki_6.6/parameters/halt_poll_ns'</code>. It cannot be unloaded while a VM is running.</p>
+    </section>
+</div>
+
+<div class="i18n" data-lang="zh-CN">
+    <section>
+        <h2>原因</h2>
+        <p>客户机的 CPU 没事做时会进入空闲，内核里的 Gunyah 驱动会立刻让这个 VM CPU 的线程睡下。下一个给它的中断——比如磁盘或网络完成——只能绕远路叫醒它：先经过虚拟机监控器，再到手机第一个核上的中断，再经过调度器，客户机才能接着跑。Windows 客户机每秒空闲上千次，每次等 I/O 都要走这一趟。</p>
+    </section>
+    <section>
+        <h2>功能</h2>
+        <p>线程睡下之前，先等一小会（最多 200 µs）看唤醒会不会马上来，就像电脑上 KVM 的<em>halt polling</em>。在这段时间内到达的完成会直接回到客户机。等待时长按每个客户机 CPU 自动调整：唤醒总在空闲后不久到来就加长，等不到就缩到 0，所以 VM 空闲时几乎不额外耗电。</p>
+        <p>内核自带的驱动不做改动，模块只在 vCPU 等待时介入。运行时关闭：<code>su -c 'echo 0 &gt; /sys/module/gunyah_halt_poll_gki_6.6/parameters/halt_poll_ns'</code>。VM 运行期间无法卸载。</p>
+    </section>
+</div>
+
+<div class="i18n" data-lang="zh-TW">
+    <section>
+        <h2>原因</h2>
+        <p>客戶機的 CPU 沒事做時會進入閒置,核心裡的 Gunyah 驅動程式會立刻讓這個 VM CPU 的執行緒睡下。下一個給它的中斷——例如磁碟或網路完成——只能繞遠路叫醒它:先經過虛擬機監控器,再到手機第一個核心上的中斷,再經過排程器,客戶機才能接著跑。Windows 客戶機每秒閒置上千次,每次等 I/O 都要走這一趟。</p>
+    </section>
+    <section>
+        <h2>功能</h2>
+        <p>執行緒睡下之前,先等一小會(最多 200 µs)看喚醒會不會馬上來,就像電腦上 KVM 的<em>halt polling</em>。在這段時間內到達的完成會直接回到客戶機。等待時長按每個客戶機 CPU 自動調整:喚醒總在閒置後不久到來就加長,等不到就縮到 0,所以 VM 閒置時幾乎不額外耗電。</p>
+        <p>核心內建的驅動程式不做改動,模組只在 vCPU 等待時介入。執行時關閉:<code>su -c 'echo 0 &gt; /sys/module/gunyah_halt_poll_gki_6.6/parameters/halt_poll_ns'</code>。VM 執行期間無法卸載。</p>
+    </section>
+</div>
+
+</body>
+</html>
