@@ -67,6 +67,7 @@
 #include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
+#include <linux/kref.h>
 #include <linux/magic.h>
 #include <linux/memfd.h>
 #include <linux/miscdevice.h>
@@ -251,11 +252,23 @@ static void ukv_resolve_optional(void)
 /* The driver (shared by native and override mode)                             */
 /* ------------------------------------------------------------------------- */
 
+/* msm_prime (see there) exists on 6.12 builds only. */
+#define UKV_MSM_PRIME	(LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0))
+
+struct mem_buf_vmperm;
+
 struct udmabuf_kv {
 	pgoff_t pagecount;
 	struct page **pages;
 	struct sg_table *sg;
 	struct miscdevice *device;
+#if UKV_MSM_PRIME
+	/* A buffer exported for Qualcomm's drivers (msm_prime): its mem_buf permissions, the table
+	 * of its pages they describe, and the count the two share with the dma-buf. */
+	struct mem_buf_vmperm *vmperm;
+	struct sg_table vmperm_sgt;
+	struct kref kref;
+#endif
 };
 
 static vm_fault_t ukv_vm_fault(struct vm_fault *vmf)
@@ -423,9 +436,8 @@ static void ukv_unmap(struct dma_buf_attachment *at, struct sg_table *sg,
 	return ukv_put_sg_table(at->dev, sg, direction, at->dma_map_attrs);
 }
 
-static void ukv_release(struct dma_buf *buf)
+static void ukv_free(struct udmabuf_kv *ubuf)
 {
-	struct udmabuf_kv *ubuf = buf->priv;
 	struct device *dev = ubuf->device->this_device;
 	pgoff_t pg;
 
@@ -438,6 +450,11 @@ static void ukv_release(struct dma_buf *buf)
 		put_page(ubuf->pages[pg]);
 	kvfree(ubuf->pages);
 	kfree(ubuf);
+}
+
+static void ukv_release(struct dma_buf *buf)
+{
+	ukv_free(buf->priv);
 }
 
 static int ukv_begin_cpu(struct dma_buf *buf, enum dma_data_direction direction)
@@ -487,6 +504,279 @@ static const struct dma_buf_ops ukv_dma_buf_ops = {
 	.begin_cpu_access  = ukv_begin_cpu,
 	.end_cpu_access    = ukv_end_cpu,
 };
+
+/* ------------------------------------------------------------------------- */
+/* msm_prime: buffers Qualcomm's drivers take as the host's own               */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Qualcomm's media and display drivers ask the vendor mem_buf layer who owns every dma-buf they
+ * import (mem_buf_dma_buf_exclusive_owner()), and mem_buf knows only the buffers exported through
+ * it. Of any other one it WARNs and answers "not the host's alone", which those drivers take for a
+ * secure buffer. msm_vidc then refuses it -- "secure buffer mapping to non-secure region 8 not
+ * allowed", QBUF -EINVAL -- and puts the whole instance in its error state, where every later
+ * REQBUFS is refused too (-EBUSY) and the buffers already queued are never let go (SM8850, 6.12:
+ * crosvm's direct decoder got no frame from any guest buffer, and the guest pages those buffers
+ * pinned outlived the VM). msm_drm refuses the PRIME import of a guest scanout the same way.
+ *
+ * With msm_prime set, each buffer created is exported the way Qualcomm's own heaps export theirs:
+ * through mem_buf_dma_buf_export(), with a mem_buf_vmperm saying the host alone holds it, read,
+ * write and execute (mem_buf_vmperm_alloc()). Those drivers then map it like any of their own.
+ * Read at each create, so whoever needs it (crosvm, for a direct decoder or a KMS display) turns it
+ * on before the guest allocates. Nothing else changes: the pages, the maps and the cache handling
+ * are this module's as for every other buffer; KGSL, which skips its access check for a dma-buf
+ * mem_buf does not know, passes a host-only one too.
+ *
+ * Only on 6.12 builds, and only after a check. The vmperm calls changed their prototypes between
+ * Qualcomm releases -- one argument on SM8750's 6.6, a release callback and its void * on SM8650's
+ * 6.1, a kref on SM8850's 6.12 (include/linux/mem-buf-exporter.h of each) -- and a call through a
+ * prototype that is not the callee's is a CFI violation, on these phones a reset with no oops. So
+ * each function is looked up by name, and called only if the kCFI type hash in front of it is the
+ * one in front of a function of ours with the prototype written here (ukv_same_cfi): the check the
+ * call itself would make, made before calling. Any miss leaves msm_prime without effect, said once.
+ */
+#if UKV_MSM_PRIME
+
+static bool msm_prime;
+module_param(msm_prime, bool, 0644);
+MODULE_PARM_DESC(msm_prime,
+	"Export new buffers through Qualcomm's mem_buf, as the host's own, so msm_vidc and msm_drm take them (1). Default 0.");
+
+static int stat_msm_prime;
+module_param(stat_msm_prime, int, 0444);
+MODULE_PARM_DESC(stat_msm_prime, "dma-bufs exported through mem_buf (read-only).");
+
+/* include/linux/mem-buf-exporter.h (SM8850, 6.12); dma_ops.attach must be NULL: mem_buf_dma_buf_export() sets it. */
+struct mem_buf_dma_buf_ops {
+	struct mem_buf_vmperm *(*lookup)(struct dma_buf *dmabuf);
+	int (*attach)(struct dma_buf *dmabuf, struct dma_buf_attachment *a);
+	struct dma_buf_ops dma_ops;
+};
+
+typedef struct mem_buf_vmperm *ukv_vmperm_alloc_t(struct sg_table *sgt, void (*release)(struct kref *),
+						  struct kref *kref);
+typedef void ukv_vmperm_free_t(struct mem_buf_vmperm *vmperm);
+typedef int ukv_vmperm_try_reclaim_t(struct mem_buf_vmperm *vmperm, bool from_notifier);
+typedef void ukv_vmperm_pin_t(struct mem_buf_vmperm *vmperm);
+typedef struct dma_buf *ukv_mem_buf_export_t(struct dma_buf_export_info *exp_info,
+					      struct mem_buf_dma_buf_ops *ops);
+
+static struct {
+	ukv_vmperm_alloc_t *alloc;
+	ukv_vmperm_free_t *free;
+	ukv_vmperm_try_reclaim_t *try_reclaim;
+	ukv_vmperm_pin_t *pin, *unpin;
+	ukv_mem_buf_export_t *export;
+	bool ready;
+} ukv_mb;
+
+/* Functions of ours with each prototype above, never called: only the type hash kCFI puts in front of
+ * them is read. */
+static struct mem_buf_vmperm *ukv_proto_alloc(struct sg_table *sgt, void (*release)(struct kref *),
+					      struct kref *kref)
+{
+	WARN_ON_ONCE(1);
+	return ERR_PTR(-EINVAL);
+}
+static void ukv_proto_free(struct mem_buf_vmperm *vmperm) { WARN_ON_ONCE(1); }
+static int ukv_proto_try_reclaim(struct mem_buf_vmperm *vmperm, bool from_notifier)
+{
+	WARN_ON_ONCE(1);
+	return -EINVAL;
+}
+static void ukv_proto_pin(struct mem_buf_vmperm *vmperm) { WARN_ON_ONCE(1); }
+static struct dma_buf *ukv_proto_export(struct dma_buf_export_info *exp_info,
+					struct mem_buf_dma_buf_ops *ops)
+{
+	WARN_ON_ONCE(1);
+	return ERR_PTR(-EINVAL);
+}
+
+#define UKV_A64_NOP	0xd503201f
+
+/**
+ * ukv_same_cfi - would an indirect call through OURS's prototype to THEIRS pass kCFI?
+ *
+ * arm64 kCFI keeps a function's 32-bit type hash in the word before its entry, or before the
+ * patchable-entry NOPs in front of it; both functions here are built with the kernel's flags, so
+ * they have the same words in front, NOPs where it pads, and the hash where it keeps it. Compared
+ * word for word back to our hash: equal, the prototypes are equal as far as CFI can tell.
+ */
+static bool ukv_same_cfi(const void *ours, unsigned long theirs, const char *name)
+{
+#ifdef CONFIG_CFI_CLANG
+	const u32 *a = ours, *b = (const u32 *)theirs;
+	int i;
+
+	for (i = 1; i <= 4; i++) {
+		u32 want = READ_ONCE(a[-i]), have = READ_ONCE(b[-i]);
+
+		if (want != have) {
+			pr_warn("msm_prime: %s has kCFI type %08x, not %08x: not the prototype this module calls it with\n",
+				name, have, want);
+			return false;
+		}
+		if (want != UKV_A64_NOP)
+			return true;
+	}
+	pr_warn("msm_prime: no kCFI type hash found in front of a function of ours; %s left alone\n", name);
+	return false;
+#else
+	return true;
+#endif
+}
+
+static unsigned long ukv_mb_sym(const char *name, const void *proto)
+{
+	unsigned long addr = ukv_sym(name);
+
+	if (!addr) {
+		pr_info("msm_prime: %s not in kallsyms (no Qualcomm mem_buf here)\n", name);
+		return 0;
+	}
+	return ukv_same_cfi(proto, addr, name) ? addr : 0;
+}
+
+static void ukv_mb_resolve(void)
+{
+	ukv_mb.alloc = (void *)ukv_mb_sym("mem_buf_vmperm_alloc", ukv_proto_alloc);
+	ukv_mb.free = (void *)ukv_mb_sym("mem_buf_vmperm_free", ukv_proto_free);
+	ukv_mb.try_reclaim = (void *)ukv_mb_sym("mem_buf_vmperm_try_reclaim", ukv_proto_try_reclaim);
+	ukv_mb.pin = (void *)ukv_mb_sym("mem_buf_vmperm_pin", ukv_proto_pin);
+	ukv_mb.unpin = (void *)ukv_mb_sym("mem_buf_vmperm_unpin", ukv_proto_pin);
+	ukv_mb.export = (void *)ukv_mb_sym("mem_buf_dma_buf_export", ukv_proto_export);
+	ukv_mb.ready = ukv_mb.alloc && ukv_mb.free && ukv_mb.try_reclaim && ukv_mb.pin && ukv_mb.unpin &&
+		       ukv_mb.export;
+	pr_info("msm_prime: Qualcomm mem_buf %s\n", ukv_mb.ready ? "found, prototypes match" : "not usable");
+}
+
+static struct mem_buf_vmperm *ukv_mp_lookup(struct dma_buf *buf)
+{
+	struct udmabuf_kv *ubuf = buf->priv;
+
+	return ubuf->vmperm;
+}
+
+static int ukv_mp_attach(struct dma_buf *buf, struct dma_buf_attachment *at)
+{
+	return 0;
+}
+
+/* The exporter's part of the vmperm contract (mem-buf-exporter.h): pinned while a device maps it, so
+ * mem_buf refuses to lend or share it meanwhile. */
+static struct sg_table *ukv_mp_map(struct dma_buf_attachment *at, enum dma_data_direction direction)
+{
+	struct udmabuf_kv *ubuf = at->dmabuf->priv;
+	struct sg_table *sg;
+
+	ukv_mb.pin(ubuf->vmperm);
+	sg = ukv_map(at, direction);
+	if (IS_ERR(sg))
+		ukv_mb.unpin(ubuf->vmperm);
+	return sg;
+}
+
+static void ukv_mp_unmap(struct dma_buf_attachment *at, struct sg_table *sg,
+			 enum dma_data_direction direction)
+{
+	struct udmabuf_kv *ubuf = at->dmabuf->priv;
+
+	ukv_unmap(at, sg, direction);
+	ukv_mb.unpin(ubuf->vmperm);
+}
+
+/* The last reference, the dma-buf's or mem_buf's: as qcom_sg_release() does. */
+static void ukv_mp_kref_release(struct kref *kref)
+{
+	struct udmabuf_kv *ubuf = container_of(kref, struct udmabuf_kv, kref);
+
+	ukv_mb.free(ubuf->vmperm);
+	sg_free_table(&ubuf->vmperm_sgt);
+	ukv_free(ubuf);
+}
+
+/* As qcom_sg_dmabuf_release(): back to the host-only state if anything moved it (nothing here
+ * does), then the dma-buf's reference goes. */
+static void ukv_mp_release(struct dma_buf *buf)
+{
+	struct udmabuf_kv *ubuf = buf->priv;
+
+	ukv_mb.try_reclaim(ubuf->vmperm, false);
+	kref_put(&ubuf->kref, ukv_mp_kref_release);
+}
+
+/* Written to by mem_buf_dma_buf_export() (dma_ops.attach), so not const. */
+static struct mem_buf_dma_buf_ops ukv_mp_ops = {
+	.lookup = ukv_mp_lookup,
+	.attach = ukv_mp_attach,
+	.dma_ops = {
+		.cache_sgt_mapping = true,
+		.map_dma_buf	   = ukv_mp_map,
+		.unmap_dma_buf	   = ukv_mp_unmap,
+		.release	   = ukv_mp_release,
+		.mmap		   = ukv_mmap,
+		.vmap		   = ukv_vmap,
+		.vunmap		   = ukv_vunmap,
+		.begin_cpu_access  = ukv_begin_cpu,
+		.end_cpu_access    = ukv_end_cpu,
+	},
+};
+
+/**
+ * ukv_export - dma_buf_export(), through mem_buf when msm_prime asks for it and mem_buf is usable.
+ *
+ * On an error nothing of @ubuf is freed here, as with dma_buf_export(): the caller's error path
+ * frees the pages and @ubuf. (mem_buf_dma_buf_export() fails after making the dma-buf only when the
+ * lookup it just installed gives no vmperm, which ukv_mp_lookup() always does.)
+ */
+static struct dma_buf *ukv_export(struct udmabuf_kv *ubuf, struct dma_buf_export_info *exp_info)
+{
+	struct dma_buf *buf;
+	int ret;
+
+	if (!READ_ONCE(msm_prime))
+		return dma_buf_export(exp_info);
+	if (!ukv_mb.ready) {
+		pr_warn_once("msm_prime is set but Qualcomm mem_buf is not usable here; plain udmabufs\n");
+		return dma_buf_export(exp_info);
+	}
+	ret = sg_alloc_table_from_pages(&ubuf->vmperm_sgt, ubuf->pages, ubuf->pagecount, 0,
+					ubuf->pagecount << PAGE_SHIFT, GFP_KERNEL);
+	if (ret)
+		return ERR_PTR(ret);
+	kref_init(&ubuf->kref);
+	ubuf->vmperm = ukv_mb.alloc(&ubuf->vmperm_sgt, ukv_mp_kref_release, &ubuf->kref);
+	if (IS_ERR(ubuf->vmperm)) {
+		ret = PTR_ERR(ubuf->vmperm);
+		goto err_sgt;
+	}
+	buf = ukv_mb.export(exp_info, &ukv_mp_ops);
+	if (IS_ERR(buf)) {
+		ret = PTR_ERR(buf);
+		ukv_mb.free(ubuf->vmperm);
+		goto err_sgt;
+	}
+	stat_msm_prime++;
+	return buf;
+
+err_sgt:
+	ubuf->vmperm = NULL;
+	sg_free_table(&ubuf->vmperm_sgt);
+	return ERR_PTR(ret);
+}
+
+#else /* !UKV_MSM_PRIME */
+
+static void ukv_mb_resolve(void)
+{
+}
+
+static struct dma_buf *ukv_export(struct udmabuf_kv *ubuf, struct dma_buf_export_info *exp_info)
+{
+	return dma_buf_export(exp_info);
+}
+
+#endif /* UKV_MSM_PRIME */
 
 #define SEALS_WANTED (F_SEAL_SHRINK)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -629,7 +919,7 @@ static long ukv_create(struct miscdevice *device,
 	/* DEFINE_DMA_BUF_EXPORT_INFO set exp_info.owner = THIS_MODULE, so every
 	 * live buffer holds a reference on us: rmmod is -EBUSY until userspace
 	 * closes them, and our ops can never outlive the module. */
-	buf = dma_buf_export(&exp_info);
+	buf = ukv_export(ubuf, &exp_info);
 	if (IS_ERR(buf)) {
 		ret = PTR_ERR(buf);
 		goto err;
@@ -1111,6 +1401,7 @@ static int __init ukv_init(void)
 
 	ukv_resolve_lookup_name();
 	ukv_resolve_optional();
+	ukv_mb_resolve();
 
 	if (!strcmp(force_mode, "native"))
 		m = UKV_NATIVE;
