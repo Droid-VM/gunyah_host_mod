@@ -48,6 +48,9 @@
  *     built-in's size_limit_mb, is the one that counts; in paramonly mode the
  *     built-in's own variable is what we raise, and it is clamped to what its
  *     int math can survive.
+ *   - msm_prime=1 (Qualcomm only, on by default) exports new buffers dressed
+ *     as mem_buf dma-bufs so the msm display driver will PRIME-import them;
+ *     see ukv_mb_ops below.
  */
 
 #define pr_fmt(fmt) "udmabuf_kv: " fmt
@@ -177,6 +180,17 @@ static int stat_failed;
 module_param(stat_failed, int, 0444);
 MODULE_PARM_DESC(stat_failed, "create attempts this module rejected (read-only).");
 
+/* On by default: msm_vidc and the panel both need it.  Read at each create, so it can still be
+ * flipped at runtime; buffers already exported keep whatever ops they were born with. */
+static bool msm_prime = true;
+module_param(msm_prime, bool, 0644);
+MODULE_PARM_DESC(msm_prime,
+	"Export new dma-bufs as Qualcomm mem_buf buffers so msm_drm can PRIME-import them (scanout). Default on.");
+
+static int stat_mem_buf;
+module_param(stat_mem_buf, int, 0444);
+MODULE_PARM_DESC(stat_mem_buf, "dma-bufs exported as mem_buf buffers (read-only).");
+
 /* ------------------------------------------------------------------------- */
 /* Runtime symbols (none of these are guaranteed by the GKI module KMI)       */
 /* ------------------------------------------------------------------------- */
@@ -242,9 +256,26 @@ static unsigned long ukv_sym_named(const char *name, const char *override,
 	return addr;
 }
 
+/*
+ * Qualcomm mem_buf (vendor module mem_buf_dev), resolved by name like everything else so the
+ * module still loads where it does not exist.  The prototypes are copied from
+ * include/linux/mem-buf-exporter.h of the warsaw kernel and must stay exact: these are indirect
+ * calls under CONFIG_CFI_CLANG, where a prototype that is merely compatible resets the SoC (see
+ * ukv_seals).  struct mem_buf_vmperm stays opaque; only its pointer type takes part in the hash.
+ */
+struct mem_buf_vmperm;
+
+static int (*ukv_mb_dma_buf_attach)(struct dma_buf *dmabuf,
+				    struct dma_buf_attachment *attachment);
+static struct mem_buf_vmperm *(*ukv_mb_vmperm_alloc)(struct sg_table *sgt);
+static int (*ukv_mb_vmperm_release)(struct mem_buf_vmperm *vmperm);
+
 static void ukv_resolve_optional(void)
 {
 	ukv_lookup_size_offset = (void *)ukv_sym("kallsyms_lookup_size_offset");
+	ukv_mb_dma_buf_attach = (void *)ukv_sym("mem_buf_dma_buf_attach");
+	ukv_mb_vmperm_alloc = (void *)ukv_sym("mem_buf_vmperm_alloc");
+	ukv_mb_vmperm_release = (void *)ukv_sym("mem_buf_vmperm_release");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -256,6 +287,10 @@ struct udmabuf_kv {
 	struct page **pages;
 	struct sg_table *sg;
 	struct miscdevice *device;
+	/* msm_prime only: the permission record mem_buf hands to importers, and the page list it
+	 * points at (never DMA-mapped by us). */
+	struct mem_buf_vmperm *vmperm;
+	struct sg_table *mb_sgt;
 };
 
 static vm_fault_t ukv_vm_fault(struct vm_fault *vmf)
@@ -433,6 +468,12 @@ static void ukv_release(struct dma_buf *buf)
 		stat_release_sg++;
 		ukv_put_sg_table(dev, ubuf->sg, DMA_BIDIRECTIONAL, 0);
 	}
+	if (ubuf->vmperm)
+		ukv_mb_vmperm_release(ubuf->vmperm);
+	if (ubuf->mb_sgt) {
+		sg_free_table(ubuf->mb_sgt);
+		kfree(ubuf->mb_sgt);
+	}
 
 	for (pg = 0; pg < ubuf->pagecount; pg++)
 		put_page(ubuf->pages[pg]);
@@ -487,6 +528,110 @@ static const struct dma_buf_ops ukv_dma_buf_ops = {
 	.begin_cpu_access  = ukv_begin_cpu,
 	.end_cpu_access    = ukv_end_cpu,
 };
+
+/*
+ * msm_drm refuses to PRIME-import anything that is not a mem_buf dma-buf: msm_gem_prime_import()
+ * asks mem_buf_dma_buf_copy_vmperm() for the buffer's VM permissions, and to_mem_buf_vmperm()
+ * answers -EINVAL ("get vmid list failure") unless dmabuf->ops->attach IS mem_buf_dma_buf_attach.
+ * Our pages are ordinary host RAM, owned by HLOS alone -- exactly what mem_buf_vmperm_alloc()
+ * records for a fresh qcom system-heap buffer -- so the honest answer is available, it just has
+ * to be asked through mem_buf's own layout.
+ *
+ * That layout is struct mem_buf_dma_buf_ops: the exporter's lookup and attach in front of a
+ * plain dma_buf_ops whose attach slot is mem_buf_dma_buf_attach itself, which container_of()s
+ * back to this struct.  Field order is ABI with mem_buf_dev, checked against the warsaw source.
+ *
+ * Off by default because every importer, KGSL included, then sees a mem_buf buffer rather than a
+ * foreign one; only the panel-scanout configuration needs that.
+ */
+struct ukv_mem_buf_ops {
+	struct mem_buf_vmperm *(*lookup)(struct dma_buf *dmabuf);
+	int (*attach)(struct dma_buf *dmabuf, struct dma_buf_attachment *a);
+	struct dma_buf_ops dma_ops;
+};
+
+static struct mem_buf_vmperm *ukv_mb_lookup(struct dma_buf *buf)
+{
+	struct udmabuf_kv *ubuf = buf->priv;
+
+	return ubuf->vmperm;
+}
+
+/* ukv_dma_buf_ops has no attach of its own; mem_buf_dma_buf_attach still calls one. */
+static int ukv_mb_attach(struct dma_buf *buf, struct dma_buf_attachment *at)
+{
+	return 0;
+}
+
+static struct ukv_mem_buf_ops ukv_mb_ops __ro_after_init;
+static bool ukv_mb_ready __ro_after_init;
+
+static void __init ukv_mb_setup(void)
+{
+	if (!ukv_mb_dma_buf_attach || !ukv_mb_vmperm_alloc || !ukv_mb_vmperm_release)
+		return;
+	ukv_mb_ops.lookup = ukv_mb_lookup;
+	ukv_mb_ops.attach = ukv_mb_attach;
+	ukv_mb_ops.dma_ops = ukv_dma_buf_ops;
+	ukv_mb_ops.dma_ops.attach = ukv_mb_dma_buf_attach;
+	ukv_mb_ready = true;
+	pr_info("mem_buf present: msm_prime available (now %s)\n",
+		READ_ONCE(msm_prime) ? "on" : "off");
+}
+
+/**
+ * ukv_mb_dress - give @ubuf the permission record that makes it a mem_buf buffer.
+ *
+ * Returns the ops to export with.  Any failure falls back to the plain ops: the buffer then
+ * still works everywhere except as a scanout source, which the display side already handles by
+ * copying.
+ */
+static const struct dma_buf_ops *ukv_mb_dress(struct udmabuf_kv *ubuf)
+{
+	struct mem_buf_vmperm *vmperm;
+	struct sg_table *sgt;
+
+	if (!READ_ONCE(msm_prime) || !ukv_mb_ready)
+		return &ukv_dma_buf_ops;
+
+	/* mem_buf keeps this for lend/share/reclaim, never for importers.  A real page list rather
+	 * than NULL, so a lend attempt fails on permissions instead of dereferencing nothing. */
+	sgt = kzalloc(sizeof(*sgt), GFP_KERNEL);
+	if (!sgt)
+		goto plain;
+	if (sg_alloc_table_from_pages(sgt, ubuf->pages, ubuf->pagecount, 0,
+				      ubuf->pagecount << PAGE_SHIFT, GFP_KERNEL) < 0) {
+		kfree(sgt);
+		goto plain;
+	}
+	vmperm = ukv_mb_vmperm_alloc(sgt);
+	if (IS_ERR_OR_NULL(vmperm)) {
+		sg_free_table(sgt);
+		kfree(sgt);
+		goto plain;
+	}
+	ubuf->mb_sgt = sgt;
+	ubuf->vmperm = vmperm;
+	return &ukv_mb_ops.dma_ops;
+
+plain:
+	pr_warn_ratelimited("mem_buf dress failed; exporting a plain buffer\n");
+	return &ukv_dma_buf_ops;
+}
+
+/* Undo ukv_mb_dress for a buffer that never got exported. */
+static void ukv_mb_undress(struct udmabuf_kv *ubuf)
+{
+	if (ubuf->vmperm) {
+		ukv_mb_vmperm_release(ubuf->vmperm);
+		ubuf->vmperm = NULL;
+	}
+	if (ubuf->mb_sgt) {
+		sg_free_table(ubuf->mb_sgt);
+		kfree(ubuf->mb_sgt);
+		ubuf->mb_sgt = NULL;
+	}
+}
 
 #define SEALS_WANTED (F_SEAL_SHRINK)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
@@ -620,7 +765,7 @@ static long ukv_create(struct miscdevice *device,
 		memfd = NULL;
 	}
 
-	exp_info.ops  = &ukv_dma_buf_ops;
+	exp_info.ops  = ukv_mb_dress(ubuf);
 	exp_info.size = ubuf->pagecount << PAGE_SHIFT;
 	exp_info.priv = ubuf;
 	exp_info.flags = O_RDWR;
@@ -632,8 +777,11 @@ static long ukv_create(struct miscdevice *device,
 	buf = dma_buf_export(&exp_info);
 	if (IS_ERR(buf)) {
 		ret = PTR_ERR(buf);
+		ukv_mb_undress(ubuf);
 		goto err;
 	}
+	if (ubuf->vmperm)
+		stat_mem_buf++;
 
 	flags = 0;
 	if (head->flags & UDMABUF_FLAGS_CLOEXEC)
@@ -1111,6 +1259,7 @@ static int __init ukv_init(void)
 
 	ukv_resolve_lookup_name();
 	ukv_resolve_optional();
+	ukv_mb_setup();
 
 	if (!strcmp(force_mode, "native"))
 		m = UKV_NATIVE;
